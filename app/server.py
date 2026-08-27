@@ -158,6 +158,23 @@ class App:
         # Nextcloud server itself and legitimately bursts -> looser cap.
         self.devices_rate_limiter = RateLimiter(capacity=20, refill_per_sec=20 / 60)
         self.notifications_rate_limiter = RateLimiter(capacity=120, refill_per_sec=120 / 60)
+        # Circuit breaker on destructive dead-token cleanup, not another
+        # per-IP limiter -- this one's keyed by a single fixed string, a
+        # shared budget across the whole fleet. Apple's BadDeviceToken (and
+        # FCM's UNREGISTERED) mean "delete this device" in the normal case
+        # (uninstalled app, expired token), which trickles in slowly. But
+        # they're also *exactly* what every device gets back if someone
+        # flips APNS_USE_SANDBOX against a fleet registered under the other
+        # environment: a token valid in production looks dead to sandbox
+        # and vice versa, and Apple can't tell us apart from a real
+        # uninstall. Reusing RateLimiter as a budget (not a per-caller gate)
+        # means a burst of "everyone just went dead" -- however many
+        # separate /notifications calls it arrives across -- runs out of
+        # budget and trips, instead of deleting the whole fleet. 10/hour is
+        # generous for organic churn on a proxy this size and tight for an
+        # environment-mismatch incident, which tries to delete everyone
+        # within the first notification round after the flip.
+        self.deletion_breaker = RateLimiter(capacity=10, refill_per_sec=10 / 3600)
 
     def push_token_hash(self, push_token: str) -> str:
         """SHA-512 hex digest of the UTF-8 push token string.
@@ -282,8 +299,17 @@ class App:
             if forget is None:
                 failed += 1
             elif forget:
-                self.store.delete(device_identifier)
-                unknown.append(device_identifier)
+                if self.deletion_breaker.allow("fleet"):
+                    self.store.delete(device_identifier)
+                    unknown.append(device_identifier)
+                else:
+                    log.error(
+                        "deletion breaker tripped -- refusing to forget %s (dead-token deletions exceeded the "
+                        "hourly budget). Likely cause: APNS_USE_SANDBOX or the FCM credentials don't match what "
+                        "your devices actually registered under -- check that before assuming devices are gone.",
+                        device_identifier,
+                    )
+                    failed += 1
             # forget is False: delivered fine, nothing to do
 
         return HTTPStatus.OK, {"unknown": unknown, "failed": failed}

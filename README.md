@@ -529,6 +529,29 @@ Flip it in `.env`, `docker compose up -d`. If every APNs device starts
 getting deleted right after registering (`BadDeviceToken` in the log), this
 mismatch is the first thing to check — see Troubleshooting.
 
+**Why the whole fleet doesn't actually get deregistered when this happens:**
+Apple can't tell "this token belongs to the other environment" apart from
+"this token is genuinely dead (uninstalled, expired)" — both come back as
+`BadDeviceToken`, and per the wire contract that's supposed to mean
+"forget this device, tell Nextcloud too" (`unknown`, which is destructive).
+Flip the environment against a fleet still registered under the old one and
+every device would fail that way at once. `App.deletion_breaker` (a
+`RateLimiter` reused as a shared budget, not a per-caller gate — see
+`app/server.py::App.__init__`) caps *destructive* dead-token cleanup at
+10/hour across the whole fleet, however many separate `/notifications`
+calls that arrives across. Past the cap, further "dead" devices are logged
+at `error` level and counted as `failed` instead of being deleted — kept,
+not silently dropped, until whoever's watching the logs sorts out whether
+it's real churn or a mismatched environment. Considered and rejected:
+requiring re-registration on every environment switch (no wire-contract
+hook to force that from the proxy side) and a per-batch threshold instead
+of a rolling one (real Nextcloud traffic sends one or a few notifications
+per call, not the whole fleet at once — a mismatch incident shows up as
+many *separate* small calls in a short window, which a per-batch cap alone
+wouldn't catch). 10/hour is a judgment call: generous for whatever organic
+device churn a proxy this size sees, tight against an incident that tries
+to empty the whole fleet within the first notification round after a flip.
+
 ### Reading the logs
 
 `docker compose logs` — timestamps are **UTC**, not local time; a line that

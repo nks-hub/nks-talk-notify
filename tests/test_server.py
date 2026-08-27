@@ -334,6 +334,33 @@ def test_notifications_410_forgets_device_and_reports_unknown(app, fake_device):
     assert app.store.get(fake_device.device_identifier) is None
 
 
+def test_notifications_deletion_breaker_caps_mass_deletion(app):
+    """Regression guard for the sandbox/production APNs mismatch scenario:
+    every registered device looks dead at once (BadDeviceToken), and without
+    a budget this would silently deregister the entire fleet in one pass."""
+    devices = [make_fake_device(f'["breaker-test-{i}","1"]'.encode()) for i in range(11)]
+    entries = []
+    for i, device in enumerate(devices):
+        app.register_device(_as_qs_dict(_register_form(device)))
+        subject = FAKE_SUBJECT
+        entries.append({
+            "deviceIdentifier": device.device_identifier,
+            "pushTokenHash": app.push_token_hash("aa" * 32),
+            "subject": base64.b64encode(subject).decode(),
+            "signature": device.sign_subject(subject),
+            "priority": "normal",
+            "type": "alert",
+        })
+    app.apns_client.result = apns.ApnsResult(status_code=410, apns_id=None, reason="Unregistered")
+
+    status, body = app.send_notifications(_notif_form(entries))
+
+    assert len(body["unknown"]) == 10  # the deletion_breaker's capacity
+    assert body["failed"] == 1  # the 11th got refused, not silently forgotten
+    surviving = [d for d in devices if app.store.get(d.device_identifier) is not None]
+    assert len(surviving) == 1, "exactly one device should have been protected by the breaker"
+
+
 def test_notifications_transient_apns_error_keeps_device_and_counts_failed(app, fake_device):
     app.register_device(_as_qs_dict(_register_form(fake_device)))
     app.apns_client.result = apns.ApnsResult(status_code=429, apns_id=None, reason="TooManyRequests")
