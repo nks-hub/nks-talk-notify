@@ -99,11 +99,17 @@ class DeviceStore:
 
         Raises PublicKeyMismatch if device_identifier already exists under a
         different user_public_key.
-        """
-        existing = self.get(device_identifier)
-        if existing is not None and existing.user_public_key != user_public_key:
-            raise PublicKeyMismatch(device_identifier)
 
+        The key check used to be a separate SELECT before this INSERT --
+        racy, because two concurrent first-registrations under different
+        keys could both pass the check before either had written anything
+        (reproduced live). The `WHERE` on the UPSERT makes the check and the
+        write one atomic statement: if the existing row's key doesn't match,
+        the conflict resolution is a no-op (SQLite UPSERT semantics) and
+        `rowcount` comes back 0 -- the only way this exact statement can
+        affect zero rows, since a brand-new device_identifier always inserts
+        directly and a matching-key conflict always updates `updated_at`.
+        """
         now = _now()
         with self._write() as cur:
             cur.execute(
@@ -114,9 +120,12 @@ class DeviceStore:
                     push_token = excluded.push_token,
                     push_token_hash = excluded.push_token_hash,
                     updated_at = excluded.updated_at
+                WHERE devices.user_public_key = excluded.user_public_key
                 """,
                 (device_identifier, user_public_key, push_token, push_token_hash, now, now),
             )
+            if cur.rowcount == 0:
+                raise PublicKeyMismatch(device_identifier)
         return self.get(device_identifier)  # type: ignore[return-value]
 
     def delete(self, device_identifier: str) -> bool:

@@ -47,3 +47,49 @@ def test_delete_device(store):
     assert store.delete("id-1") is True
     assert store.get("id-1") is None
     assert store.delete("id-1") is False  # idempotent, already gone
+
+
+def test_concurrent_first_registrations_under_different_keys_never_corrupt(store):
+    """Regression test for a real race: the key-mismatch check used to be a
+    SELECT before the INSERT, outside the write lock. Two concurrent first
+    registrations of the same (brand new) device_identifier under different
+    keys could both pass the check, then one caller's key would land next
+    to the *other* caller's push_token -- a stored row that belongs to
+    neither registration. Fire N of these at once; exactly one may win, and
+    whichever wins must be fully self-consistent (its own key AND its own
+    token, never a mix)."""
+    import threading
+
+    n = 8
+    results: list[tuple[int, bool]] = []
+    results_lock = threading.Lock()
+    barrier = threading.Barrier(n)
+
+    def attempt(i: int) -> None:
+        barrier.wait()  # maximize actual overlap, not just call ordering
+        try:
+            store.register(
+                device_identifier="shared-id",
+                user_public_key=f"pubkey-{i}",
+                push_token=f"token-{i}",
+                push_token_hash=f"hash-{i}",
+            )
+            ok = True
+        except PublicKeyMismatch:
+            ok = False
+        with results_lock:
+            results.append((i, ok))
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    winners = [i for i, ok in results if ok]
+    assert len(winners) == 1, f"expected exactly one winner, got {winners}"
+    (winner,) = winners
+
+    stored = store.get("shared-id")
+    assert stored.user_public_key == f"pubkey-{winner}"
+    assert stored.push_token == f"token-{winner}"  # never another thread's token
