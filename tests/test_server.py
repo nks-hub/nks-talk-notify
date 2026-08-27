@@ -543,6 +543,39 @@ def test_oversized_body_is_rejected(live_server):
         assert e.code == 413
 
 
+def test_oversized_body_drain_is_capped_not_unbounded(live_server):
+    """S3 regression guard: draining the full attacker-declared Content-Length
+    (rather than a small capped amount) reopens the DoS the cap exists to
+    close -- a slow/never-finished upload would tie up a worker indefinitely.
+
+    Declares a huge length, sends only a few KB, and *keeps the connection
+    open* (no EOF) -- an uncapped drain blocks forever waiting for the rest
+    of the declared length, since nothing more is ever sent. A capped drain
+    reads only its cap and responds immediately regardless."""
+    import socket
+    from urllib.parse import urlsplit
+
+    base_url, _fake = live_server
+    parts = urlsplit(base_url)
+    huge_declared_length = 50 * 1024 * 1024  # 50 MiB, never actually sent
+
+    with socket.create_connection((parts.hostname, parts.port), timeout=5) as sock:
+        sock.sendall(
+            f"POST /devices HTTP/1.1\r\n"
+            f"Host: {parts.netloc}\r\n"
+            f"Content-Length: {huge_declared_length}\r\n\r\n".encode()
+        )
+        sock.sendall(b"a" * 70000)  # over the 64 KiB drain cap, still far short of the declared length
+        # deliberately no shutdown/EOF -- a well-behaved capped drain must
+        # not need one to respond
+        sock.settimeout(2)
+        try:
+            response = sock.recv(4096)
+        except TimeoutError:
+            assert False, "no response within 2s -- drain looks unbounded (waiting for the rest of Content-Length)"
+    assert response.decode().startswith("HTTP/1.1 413")
+
+
 def test_oversized_body_with_expect_100_continue_gets_413_not_a_hang(live_server):
     """Regression test for a real production incident: with protocol_version
     left at the stdlib default (HTTP/1.0), handle_expect_100 is never

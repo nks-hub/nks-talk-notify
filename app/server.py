@@ -290,13 +290,17 @@ def make_handler(app: App):
             body = self.rfile.read(length) if length else b""
             return parse_qs(body.decode("utf-8"), keep_blank_values=True)
 
-        def _drain(self, length: int, chunk_size: int = 65536) -> None:
-            remaining = length
-            while remaining > 0:
-                chunk = self.rfile.read(min(chunk_size, remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
+        def _drain(self, length: int, cap: int = 65536) -> None:
+            # Only ever read up to `cap` regardless of the declared
+            # Content-Length: draining the full attacker-declared length
+            # (possibly slow-trickled) would tie up this worker for as long
+            # as they feel like sending, which is exactly the resource
+            # exhaustion S3 exists to prevent. A partial read is enough to
+            # make our 413 response land cleanly in the common case; if the
+            # client/proxy still gets a broken pipe because it hadn't
+            # finished sending, that's an acceptable outcome for a request
+            # we've already decided to reject.
+            self.rfile.read(min(length, cap))
 
         def _client_ip(self) -> str:
             # Deployed behind the ISPConfig/Apache reverse proxy on gateway-host,
