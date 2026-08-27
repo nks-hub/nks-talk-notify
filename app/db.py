@@ -15,6 +15,7 @@ as it keeps proving ownership of the original private key.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -64,6 +65,10 @@ class DeviceStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
+        try:
+            os.chmod(db_path, 0o600)  # S8: push tokens are sensitive, owner-only
+        except OSError:
+            pass  # e.g. read-only filesystem in some test setups; not fatal
 
     def close(self) -> None:
         self._conn.close()

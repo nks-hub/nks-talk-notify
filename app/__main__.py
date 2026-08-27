@@ -21,6 +21,13 @@ def main() -> int:
         log.error("configuration error: %s", exc)
         return 1
 
+    if not config.nextcloud_subscription_key:
+        log.warning(
+            "NEXTCLOUD_SUBSCRIPTION_KEY is not set -- POST /notifications accepts requests from "
+            "anyone who can reach this proxy. Set it once your Nextcloud server has "
+            "subscription_aware_server pointed at this proxy (see README)."
+        )
+
     store = DeviceStore(config.db_path)
     apns_client = apns.ApnsClient(
         key_path=config.apns_key_path,

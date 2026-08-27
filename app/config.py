@@ -26,6 +26,7 @@ class Config:
     db_path: str
     listen_host: str
     listen_port: int
+    nextcloud_subscription_key: str
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -38,4 +39,9 @@ class Config:
             db_path=os.environ.get("DB_PATH", "/data/devices.db").strip(),
             listen_host=os.environ.get("LISTEN_HOST", "0.0.0.0").strip(),
             listen_port=int(os.environ.get("LISTEN_PORT", "8080").strip()),
+            # S1: matches Nextcloud's own Push::sendNotificationsToProxies
+            # X-Nextcloud-Subscription-Key header, sent only when this proxy's
+            # URL is registered as the server's `subscription_aware_server`.
+            # Empty = unauthenticated /notifications (warn at startup, don't block).
+            nextcloud_subscription_key=os.environ.get("NEXTCLOUD_SUBSCRIPTION_KEY", "").strip(),
         )

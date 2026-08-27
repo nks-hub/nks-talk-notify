@@ -8,9 +8,12 @@ exact Nextcloud source lines it was verified against.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import re
+import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
@@ -24,6 +27,68 @@ log = logging.getLogger("nks-talk-notify")
 
 _NOTIFICATION_KEY_RE = re.compile(r"^notifications\[(\d+)\]$")
 
+# S2: lowercase hex only -- must match exactly how the client hashes it for
+# Nextcloud's own pushTokenHash, or the two never agree on the same device.
+_PUSH_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# S4: RSA-2048 ciphertext is always exactly 256 bytes -> base64 is always
+# exactly 344 chars. Anything else is malformed by definition, reject before
+# spending a public-key verify on it.
+_EXPECTED_SUBJECT_B64_LEN = 344
+
+MAX_BODY_BYTES = 1024 * 1024  # S3: 1 MiB request cap
+MAX_NOTIFICATIONS_PER_REQUEST = 100  # S4: cap batch size
+
+
+class RateLimiter:
+    """Per-key token bucket. S3: cheap DoS guard, not a precision limiter."""
+
+    def __init__(self, capacity: int, refill_per_sec: float):
+        self._capacity = capacity
+        self._refill_per_sec = refill_per_sec
+        self._buckets: dict[str, tuple[float, float]] = {}
+        self._lock = threading.Lock()
+        # ponytail: buckets are never evicted; fine for the IP cardinality a
+        # single proxy sees, revisit only if that stops being true.
+
+    def allow(self, key: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            tokens, last = self._buckets.get(key, (float(self._capacity), now))
+            tokens = min(self._capacity, tokens + (now - last) * self._refill_per_sec)
+            if tokens < 1:
+                self._buckets[key] = (tokens, now)
+                return False
+            self._buckets[key] = (tokens - 1, now)
+            return True
+
+
+class ReplayGuard:
+    """S5: dedupe (deviceIdentifier, signature) pairs within a TTL window.
+
+    The native protocol has no nonce/timestamp, so a captured notification
+    is replayable forever without this. A short TTL is enough since a real
+    replay attempt follows shortly after the original; it doesn't need to
+    catch one a week later to be useful.
+    """
+
+    def __init__(self, ttl_seconds: float = 300.0):
+        self._ttl = ttl_seconds
+        self._seen: dict[tuple[str, str], float] = {}
+        self._lock = threading.Lock()
+
+    def seen_before(self, key: tuple[str, str]) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            # ponytail: O(n) prune on every write; fine at this proxy's scale,
+            # swap for a proper TTL cache if the device count ever makes it hot.
+            for stale_key in [k for k, expires_at in self._seen.items() if expires_at < now]:
+                del self._seen[stale_key]
+            if key in self._seen:
+                return True
+            self._seen[key] = now + self._ttl
+            return False
+
 
 class App:
     """Holds the long-lived dependencies a request handler needs."""
@@ -32,6 +97,12 @@ class App:
         self.config = config
         self.store = store
         self.apns_client = apns_client
+        self.replay_guard = ReplayGuard()
+        # S3: /devices is client-facing and cheap to abuse -> tight cap.
+        # /notifications is the (trusted, but unauthenticated-if-S1-unset)
+        # Nextcloud server itself and legitimately bursts -> looser cap.
+        self.devices_rate_limiter = RateLimiter(capacity=20, refill_per_sec=20 / 60)
+        self.notifications_rate_limiter = RateLimiter(capacity=120, refill_per_sec=120 / 60)
 
     def push_token_hash(self, push_token: str) -> str:
         """SHA-512 hex digest of the UTF-8 push token string.
@@ -51,6 +122,9 @@ class App:
         if not (push_token and device_identifier and signature and public_key):
             return HTTPStatus.BAD_REQUEST, {"message": "MISSING_FIELDS"}
 
+        if not _PUSH_TOKEN_RE.match(push_token):  # S2: path-injection guard, cheap so check first
+            return HTTPStatus.BAD_REQUEST, {"message": "INVALID_PUSH_TOKEN"}
+
         if not crypto.verify_device_identifier_signature(
             device_identifier_b64=device_identifier, signature_b64=signature, public_key_pem=public_key
         ):
@@ -64,7 +138,9 @@ class App:
                 push_token_hash=self.push_token_hash(push_token),
             )
         except PublicKeyMismatch:
-            return HTTPStatus.CONFLICT, {"message": "DEVICE_IDENTIFIER_KEY_MISMATCH"}
+            # S6: 403 "unauthorized for this identifier", not 409 -- we don't
+            # implement the push-v2 cloudId retry flow that 409 implies.
+            return HTTPStatus.FORBIDDEN, {"message": "DEVICE_IDENTIFIER_KEY_MISMATCH"}
         return HTTPStatus.OK, {}
 
     def unregister_device(self, params: dict) -> tuple[int, dict]:
@@ -85,12 +161,18 @@ class App:
             return HTTPStatus.BAD_REQUEST, {"message": "INVALID_SIGNATURE"}
 
         self.store.delete(device_identifier)
-        return HTTPStatus.ACCEPTED, {}
+        return HTTPStatus.OK, {}  # S7: push-v2 spec says 200, not 202
 
     def send_notifications(self, form: dict) -> tuple[int, dict]:
         entries = _parse_notification_entries(form)
         unknown: list[str] = []
         failed = 0
+
+        # S4: cap batch size -- process the first N, count the rest as failed
+        # so an oversized batch is visible instead of silently truncated.
+        if len(entries) > MAX_NOTIFICATIONS_PER_REQUEST:
+            failed += len(entries) - MAX_NOTIFICATIONS_PER_REQUEST
+            entries = entries[:MAX_NOTIFICATIONS_PER_REQUEST]
 
         for raw in entries:
             try:
@@ -105,6 +187,10 @@ class App:
                 failed += 1
                 continue
 
+            # "unknown" is destructive (Nextcloud deletes its record on it), so
+            # a lookup miss must win over any other validation of this entry --
+            # never let a malformed field turn a genuinely unknown device into
+            # a "failed" instead.
             device = self.store.get(device_identifier)
             if device is None:
                 unknown.append(device_identifier)
@@ -115,12 +201,20 @@ class App:
                 failed += 1
                 continue
 
+            if len(subject) != _EXPECTED_SUBJECT_B64_LEN:  # S4
+                log.warning("subject has the wrong length for an RSA-2048 ciphertext")
+                failed += 1
+                continue
+
             if not crypto.verify_subject_signature(
                 subject_b64=subject, signature_b64=signature, public_key_pem=device.user_public_key
             ):
                 log.warning("subject signature failed verification")
                 failed += 1
                 continue
+
+            if self.replay_guard.seen_before((device_identifier, signature)):  # S5
+                continue  # already delivered once, silently drop the repeat
 
             push_type, priority = apns.push_type_and_priority(nc_type, nc_priority)
             payload = apns.build_payload(push_type=push_type, encrypted_subject_b64=subject)
@@ -179,6 +273,23 @@ def make_handler(app: App):
             body = self.rfile.read(length) if length else b""
             return parse_qs(body.decode("utf-8"), keep_blank_values=True)
 
+        def _drain(self, length: int, chunk_size: int = 65536) -> None:
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(chunk_size, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+
+        def _client_ip(self) -> str:
+            # Deployed behind the ISPConfig/Apache reverse proxy on gateway-host,
+            # which sets X-Forwarded-For; fall back to the raw peer for
+            # direct/local access (tests, health checks).
+            forwarded = self.headers.get("X-Forwarded-For")
+            if forwarded:
+                return forwarded.split(",")[0].strip()
+            return self.client_address[0]
+
         def _route_get(self) -> tuple[int, dict]:
             path = urlsplit(self.path).path
             if path == "/health":
@@ -194,11 +305,30 @@ def make_handler(app: App):
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlsplit(self.path).path
-            form = self._read_form()
+
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            if length > MAX_BODY_BYTES:  # S3
+                self._drain(length)  # avoid an RST racing our response (esp. on Windows)
+                self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"message": "BODY_TOO_LARGE"})
+                self.close_connection = True
+                return
+
             if path == "/devices":
-                status, body = app.register_device(form)
+                if not app.devices_rate_limiter.allow(self._client_ip()):  # S3
+                    self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"message": "RATE_LIMITED"})
+                    return
+                status, body = app.register_device(self._read_form())
             elif path == "/notifications":
-                status, body = app.send_notifications(form)
+                key = app.config.nextcloud_subscription_key
+                if key and not hmac.compare_digest(
+                    self.headers.get("X-Nextcloud-Subscription-Key", ""), key
+                ):  # S1
+                    self._send_json(HTTPStatus.UNAUTHORIZED, {"message": "UNAUTHORIZED"})
+                    return
+                if not app.notifications_rate_limiter.allow(self._client_ip()):  # S3
+                    self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"message": "RATE_LIMITED"})
+                    return
+                status, body = app.send_notifications(self._read_form())
             else:
                 status, body = HTTPStatus.NOT_FOUND, {"message": "NOT_FOUND"}
             self._send_json(status, body)

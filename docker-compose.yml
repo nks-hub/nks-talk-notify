@@ -11,4 +11,6 @@ services:
       - ./data:/data
       - ${APNS_KEY_HOST_PATH}:/secrets/apns-key.p8:ro
     ports:
-      - "${LISTEN_PORT:-8080}:8080"
+      # S8: bind to a specific host address, never 0.0.0.0 -- see BIND_ADDR
+      # in .env.example.
+      - "${BIND_ADDR:-127.0.0.1}:${LISTEN_PORT:-8080}:8080"

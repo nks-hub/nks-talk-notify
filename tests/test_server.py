@@ -31,10 +31,15 @@ class FakeApnsClient:
 
 OK_RESULT = apns.ApnsResult(status_code=200, apns_id="abc", reason=None)
 
+# S4: real `subject` is always base64 of a 256-byte RSA-2048 ciphertext
+# (344 chars). Tests that aren't specifically about that length must use a
+# correctly-sized stand-in or they'll be rejected before reaching the code
+# path they mean to exercise.
+FAKE_SUBJECT = bytes(range(256))
 
-@pytest.fixture
-def app(tmp_path):
-    config = Config(
+
+def _make_config(tmp_path, **overrides):
+    defaults = dict(
         apns_key_path="unused",
         apns_key_id="unused",
         apns_team_id="unused",
@@ -43,7 +48,15 @@ def app(tmp_path):
         db_path=str(tmp_path / "devices.db"),
         listen_host="127.0.0.1",
         listen_port=0,
+        nextcloud_subscription_key="",
     )
+    defaults.update(overrides)
+    return Config(**defaults)
+
+
+@pytest.fixture
+def app(tmp_path):
+    config = _make_config(tmp_path)
     store = DeviceStore(config.db_path)
     fake = FakeApnsClient(OK_RESULT)
     a = App(config, store, fake)
@@ -148,7 +161,7 @@ def test_register_device_self_consistent_forgery_is_rejected_by_key_pin(app, fak
         "userPublicKey": attacker.public_key_pem,
     }
     status, body = app.register_device(_as_qs_dict(hijack_form))
-    assert status == HTTPStatus.CONFLICT
+    assert status == HTTPStatus.FORBIDDEN  # S6: not 409 -- we don't implement the cloudId retry flow
     assert app.store.get(fake_device.device_identifier).user_public_key == fake_device.public_key_pem
 
 
@@ -165,7 +178,7 @@ def test_unregister_valid_signature_deletes(app, fake_device):
     status, _ = app.unregister_device(
         _as_qs_dict({"deviceIdentifier": fake_device.device_identifier, "deviceIdentifierSignature": fake_device.signature})
     )
-    assert status == HTTPStatus.ACCEPTED
+    assert status == HTTPStatus.OK  # S7: push-v2 spec says 200, not 202
     assert app.store.get(fake_device.device_identifier) is None
 
 
@@ -199,12 +212,11 @@ def test_notifications_unknown_device(app):
 
 def test_notifications_pushtokenhash_mismatch_counts_as_failed(app, fake_device):
     app.register_device(_as_qs_dict(_register_form(fake_device)))
-    subject = b"ciphertext"
-    signature = fake_device.sign_subject(subject)
+    signature = fake_device.sign_subject(FAKE_SUBJECT)
     entry = {
         "deviceIdentifier": fake_device.device_identifier,
         "pushTokenHash": "wrong-hash",
-        "subject": base64.b64encode(subject).decode(),
+        "subject": base64.b64encode(FAKE_SUBJECT).decode(),
         "signature": signature,
         "priority": "high",
         "type": "alert",
@@ -214,12 +226,29 @@ def test_notifications_pushtokenhash_mismatch_counts_as_failed(app, fake_device)
     assert body == {"unknown": [], "failed": 1}
 
 
+def test_notifications_wrong_subject_length_counts_as_failed(app, fake_device):
+    """S4: base64 of an RSA-2048 ciphertext is always 344 chars, reject anything else."""
+    app.register_device(_as_qs_dict(_register_form(fake_device)))
+    short_subject = b"too-short-to-be-real-rsa-ciphertext"
+    entry = {
+        "deviceIdentifier": fake_device.device_identifier,
+        "pushTokenHash": app.push_token_hash("aa" * 32),
+        "subject": base64.b64encode(short_subject).decode(),
+        "signature": fake_device.sign_subject(short_subject),
+        "priority": "high",
+        "type": "alert",
+    }
+    status, body = app.send_notifications(_notif_form([entry]))
+    assert body == {"unknown": [], "failed": 1}
+    assert app.apns_client.calls == []
+
+
 def test_notifications_bad_subject_signature_counts_as_failed(app, fake_device):
     app.register_device(_as_qs_dict(_register_form(fake_device)))
     entry = {
         "deviceIdentifier": fake_device.device_identifier,
         "pushTokenHash": app.push_token_hash("aa" * 32),
-        "subject": base64.b64encode(b"ciphertext").decode(),
+        "subject": base64.b64encode(FAKE_SUBJECT).decode(),
         "signature": base64.b64encode(b"forged-signature-bytes-not-valid!!").decode(),
         "priority": "high",
         "type": "alert",
@@ -230,7 +259,7 @@ def test_notifications_bad_subject_signature_counts_as_failed(app, fake_device):
 
 def test_notifications_success_calls_apns_with_mapped_priority(app, fake_device):
     app.register_device(_as_qs_dict(_register_form(fake_device)))
-    subject = b"ciphertext-blob"
+    subject = FAKE_SUBJECT
     entry = {
         "deviceIdentifier": fake_device.device_identifier,
         "pushTokenHash": app.push_token_hash("aa" * 32),
@@ -250,10 +279,29 @@ def test_notifications_success_calls_apns_with_mapped_priority(app, fake_device)
     assert call["payload"]["nc-subject"] == base64.b64encode(subject).decode()
 
 
+def test_notifications_replay_is_silently_dropped(app, fake_device):
+    """S5: the same (deviceIdentifier, signature) pair twice must not double-send."""
+    app.register_device(_as_qs_dict(_register_form(fake_device)))
+    subject = FAKE_SUBJECT
+    entry = {
+        "deviceIdentifier": fake_device.device_identifier,
+        "pushTokenHash": app.push_token_hash("aa" * 32),
+        "subject": base64.b64encode(subject).decode(),
+        "signature": fake_device.sign_subject(subject),
+        "priority": "normal",
+        "type": "alert",
+    }
+    status1, body1 = app.send_notifications(_notif_form([entry]))
+    status2, body2 = app.send_notifications(_notif_form([entry]))  # identical replay
+    assert body1 == {"unknown": [], "failed": 0}
+    assert body2 == {"unknown": [], "failed": 0}  # not "failed", not "unknown" -- silently deduped
+    assert len(app.apns_client.calls) == 1  # APNs only actually called once
+
+
 def test_notifications_410_forgets_device_and_reports_unknown(app, fake_device):
     app.register_device(_as_qs_dict(_register_form(fake_device)))
     app.apns_client.result = apns.ApnsResult(status_code=410, apns_id=None, reason="Unregistered")
-    subject = b"x"
+    subject = FAKE_SUBJECT
     entry = {
         "deviceIdentifier": fake_device.device_identifier,
         "pushTokenHash": app.push_token_hash("aa" * 32),
@@ -270,7 +318,7 @@ def test_notifications_410_forgets_device_and_reports_unknown(app, fake_device):
 def test_notifications_transient_apns_error_keeps_device_and_counts_failed(app, fake_device):
     app.register_device(_as_qs_dict(_register_form(fake_device)))
     app.apns_client.result = apns.ApnsResult(status_code=429, apns_id=None, reason="TooManyRequests")
-    subject = b"x"
+    subject = FAKE_SUBJECT
     entry = {
         "deviceIdentifier": fake_device.device_identifier,
         "pushTokenHash": app.push_token_hash("aa" * 32),
@@ -290,29 +338,63 @@ def test_notifications_malformed_json_entry_counts_as_failed(app):
     assert body == {"unknown": [], "failed": 1}
 
 
+def test_notifications_batch_over_cap_counts_extras_as_failed(app):
+    """S4: a batch bigger than the cap is processed up to the cap, rest counted failed."""
+    from app.server import MAX_NOTIFICATIONS_PER_REQUEST
+
+    entries = [{"deviceIdentifier": f"nope-{i}", "pushTokenHash": "x", "subject": "x", "signature": "x"} for i in range(MAX_NOTIFICATIONS_PER_REQUEST + 5)]
+    status, body = app.send_notifications(_notif_form(entries))
+    assert status == HTTPStatus.OK
+    assert body["failed"] == 5
+    assert len(body["unknown"]) == MAX_NOTIFICATIONS_PER_REQUEST  # only the processed ones looked up
+
+
+# --- push token format (S2) --------------------------------------------------
+
+
+def test_register_device_rejects_non_hex_push_token(app, fake_device):
+    form = _register_form(fake_device)
+    form["pushToken"] = "../../etc/passwd"
+    status, body = app.register_device(_as_qs_dict(form))
+    assert status == HTTPStatus.BAD_REQUEST
+    assert body["message"] == "INVALID_PUSH_TOKEN"
+
+
+def test_register_device_rejects_uppercase_push_token(app, fake_device):
+    """Must match Nextcloud's own pushTokenHash regex expectations -- lowercase only."""
+    form = _register_form(fake_device)
+    form["pushToken"] = "AA" * 32
+    status, body = app.register_device(_as_qs_dict(form))
+    assert status == HTTPStatus.BAD_REQUEST
+    assert body["message"] == "INVALID_PUSH_TOKEN"
+
+
+def test_register_device_rejects_wrong_length_push_token(app, fake_device):
+    form = _register_form(fake_device)
+    form["pushToken"] = "aa" * 31  # 62 hex chars, not 64
+    status, body = app.register_device(_as_qs_dict(form))
+    assert status == HTTPStatus.BAD_REQUEST
+    assert body["message"] == "INVALID_PUSH_TOKEN"
+
+
 # --- real HTTP wire test (form-urlencoded, matching Nextcloud's client) -----
+
+
+def _start_live_server(tmp_path, **config_overrides):
+    config = _make_config(tmp_path, **config_overrides)
+    store = DeviceStore(config.db_path)
+    fake = FakeApnsClient(OK_RESULT)
+    server = run_server(config, store, fake)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    return f"http://127.0.0.1:{port}", fake, server, store
 
 
 @pytest.fixture
 def live_server(tmp_path):
-    config = Config(
-        apns_key_path="unused",
-        apns_key_id="unused",
-        apns_team_id="unused",
-        apns_topic="com.nkshub.nextcloudtalk",
-        apns_use_sandbox=True,
-        db_path=str(tmp_path / "devices.db"),
-        listen_host="127.0.0.1",
-        listen_port=0,
-    )
-    store = DeviceStore(config.db_path)
-    fake = FakeApnsClient(OK_RESULT)
-    server = run_server(config, store, fake)
-    server.RequestHandlerClass  # noqa: B018 - touch attribute to be explicit it's used
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    port = server.server_address[1]
-    yield f"http://127.0.0.1:{port}", fake
+    base_url, fake, server, store = _start_live_server(tmp_path)
+    yield base_url, fake
     server.shutdown()
     server.server_close()
     store.close()
@@ -344,7 +426,7 @@ def test_register_and_notify_over_http_form_urlencoded(live_server, fake_device)
     with urllib.request.urlopen(req, timeout=5) as resp:
         assert resp.status == 200
 
-    subject = b"real-wire-subject"
+    subject = FAKE_SUBJECT
     entry = {
         "deviceIdentifier": fake_device.device_identifier,
         "pushTokenHash": hash_for_wire_test(form["pushToken"]),
@@ -380,7 +462,7 @@ def test_delete_device_over_http_query_params(live_server, fake_device):
     qs = urlencode({"deviceIdentifier": fake_device.device_identifier, "deviceIdentifierSignature": fake_device.signature})
     req = urllib.request.Request(f"{base_url}/devices?{qs}", method="DELETE")
     with urllib.request.urlopen(req, timeout=5) as resp:
-        assert resp.status == 202
+        assert resp.status == 200  # S7
 
 
 def test_unknown_route_is_404(live_server):
@@ -390,3 +472,93 @@ def test_unknown_route_is_404(live_server):
         assert False, "expected HTTPError"
     except urllib.error.HTTPError as e:
         assert e.code == 404
+
+
+# --- S1: subscription key auth on /notifications only -----------------------
+
+
+def test_notifications_requires_subscription_key_when_configured(tmp_path):
+    base_url, fake, server, store = _start_live_server(tmp_path, nextcloud_subscription_key="s3cr3t")
+    try:
+        req = urllib.request.Request(f"{base_url}/notifications", data=b"notifications%5B0%5D=x", method="POST")
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            assert False, "expected 401"
+        except urllib.error.HTTPError as e:
+            assert e.code == 401
+    finally:
+        server.shutdown()
+        server.server_close()
+        store.close()
+
+
+def test_notifications_accepts_correct_subscription_key(tmp_path, fake_device):
+    base_url, fake, server, store = _start_live_server(tmp_path, nextcloud_subscription_key="s3cr3t")
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/notifications",
+            data=urlencode({"notifications[0]": json.dumps({"deviceIdentifier": "nope", "pushTokenHash": "x", "subject": "x", "signature": "x"})}).encode(),
+            method="POST",
+            headers={"X-Nextcloud-Subscription-Key": "s3cr3t"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+        store.close()
+
+
+def test_devices_endpoint_is_not_gated_by_subscription_key(tmp_path, fake_device):
+    """S1: the header only ever comes from Nextcloud's server-to-proxy call,
+    never from the client's own registration -- /devices must stay reachable."""
+    base_url, fake, server, store = _start_live_server(tmp_path, nextcloud_subscription_key="s3cr3t")
+    try:
+        form = _register_form(fake_device)
+        req = urllib.request.Request(
+            f"{base_url}/devices", data=urlencode(form).encode(), method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+        store.close()
+
+
+# --- S3: body size cap -------------------------------------------------------
+
+
+def test_oversized_body_is_rejected(live_server):
+    from app.server import MAX_BODY_BYTES
+
+    base_url, _fake = live_server
+    oversized = b"a" * (MAX_BODY_BYTES + 1)
+    req = urllib.request.Request(f"{base_url}/devices", data=oversized, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        assert False, "expected 413"
+    except urllib.error.HTTPError as e:
+        assert e.code == 413
+
+
+def test_devices_rate_limit_returns_429(tmp_path, fake_device):
+    """S3: the bucket capacity is small enough to hit within a single test."""
+    base_url, fake, server, store = _start_live_server(tmp_path)
+    try:
+        form = _register_form(fake_device)
+        data = urlencode(form).encode()
+        statuses = []
+        for _ in range(25):  # capacity is 20
+            req = urllib.request.Request(f"{base_url}/devices", data=data, method="POST")
+            try:
+                resp = urllib.request.urlopen(req, timeout=5)
+                statuses.append(resp.status)
+            except urllib.error.HTTPError as e:
+                statuses.append(e.code)
+        assert 429 in statuses
+    finally:
+        server.shutdown()
+        server.server_close()
+        store.close()
