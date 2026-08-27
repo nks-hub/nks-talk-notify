@@ -326,6 +326,14 @@ def test_health_endpoint_over_http(live_server):
         assert body == {"status": "ok", "devices": 0}
 
 
+def test_health_endpoint_supports_head(live_server):
+    base_url, _fake = live_server
+    req = urllib.request.Request(f"{base_url}/health", method="HEAD")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 200
+        assert resp.read() == b""  # HEAD must not carry a body
+
+
 def test_register_and_notify_over_http_form_urlencoded(live_server, fake_device):
     base_url, fake = live_server
     form = _register_form(fake_device)

@@ -165,13 +165,13 @@ def make_handler(app: App):
         def log_message(self, fmt: str, *args) -> None:  # quiet default stderr access log
             log.info("%s - %s", self.address_string(), fmt % args)
 
-        def _send_json(self, status: int, body: dict) -> None:
+        def _send_json(self, status: int, body: dict, write_body: bool = True) -> None:
             payload = json.dumps(body).encode("utf-8") if body else b""
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            if payload:
+            if payload and write_body:
                 self.wfile.write(payload)
 
         def _read_form(self) -> dict:
@@ -179,12 +179,18 @@ def make_handler(app: App):
             body = self.rfile.read(length) if length else b""
             return parse_qs(body.decode("utf-8"), keep_blank_values=True)
 
-        def do_GET(self) -> None:  # noqa: N802 (stdlib naming convention)
+        def _route_get(self) -> tuple[int, dict]:
             path = urlsplit(self.path).path
             if path == "/health":
-                self._send_json(HTTPStatus.OK, {"status": "ok", "devices": app.store.count()})
-                return
-            self._send_json(HTTPStatus.NOT_FOUND, {"message": "NOT_FOUND"})
+                return HTTPStatus.OK, {"status": "ok", "devices": app.store.count()}
+            return HTTPStatus.NOT_FOUND, {"message": "NOT_FOUND"}
+
+        def do_GET(self) -> None:  # noqa: N802 (stdlib naming convention)
+            self._send_json(*self._route_get())
+
+        def do_HEAD(self) -> None:  # noqa: N802 -- health checks/monitoring probe with HEAD too
+            status, body = self._route_get()
+            self._send_json(status, body, write_body=False)
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlsplit(self.path).path
