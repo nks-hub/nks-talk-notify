@@ -163,11 +163,12 @@ class App:
         # shared budget across the whole fleet. Apple's BadDeviceToken (and
         # FCM's UNREGISTERED) mean "delete this device" in the normal case
         # (uninstalled app, expired token), which trickles in slowly. But
-        # they're also *exactly* what every device gets back if someone
-        # flips APNS_USE_SANDBOX against a fleet registered under the other
-        # environment: a token valid in production looks dead to sandbox
-        # and vice versa, and Apple can't tell us apart from a real
-        # uninstall. Reusing RateLimiter as a budget (not a per-caller gate)
+        # they're also *exactly* what legacy APNs registrations get back if
+        # someone flips their APNS_USE_SANDBOX fallback against the
+        # environment that issued those tokens. Explicit per-device
+        # environments prevent this for current clients, but Apple still
+        # cannot distinguish a legacy mismatch from a real uninstall.
+        # Reusing RateLimiter as a budget (not a per-caller gate)
         # means a burst of "everyone just went dead" -- however many
         # separate /notifications calls it arrives across -- runs out of
         # budget and trips, instead of deleting the whole fleet. 10/hour is

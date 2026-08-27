@@ -444,7 +444,7 @@ See `.env.example` for the full annotated list. Summary:
 | `APNS_KEY_ID` | one of APNs/FCM | the key's Key ID (Apple Developer portal) |
 | `APNS_TEAM_ID` | one of APNs/FCM | Apple Developer Team ID |
 | `APNS_TOPIC` | no (default `com.nkshub.nextcloudtalk`) | app bundle id / APNs topic |
-| `APNS_USE_SANDBOX` | no (default `0`) | `1` to talk to `api.sandbox.push.apple.com` (debug/TestFlight builds) |
+| `APNS_USE_SANDBOX` | no (default `0`) | fallback for legacy APNs registrations without `pushEnvironment`; `1` = development, `0` = production |
 | `FCM_PROJECT_ID` | one of APNs/FCM | Google Cloud/Firebase project ID this proxy sends through |
 | `FCM_SERVICE_ACCOUNT_PATH` | one of APNs/FCM | path to the service account JSON inside the container |
 | `DB_PATH` | no (default `/data/devices.db`) | SQLite file |
@@ -595,23 +595,26 @@ app.
 No client-side change is needed here either — same reasoning as the APNs
 key.
 
-### Switching APNs between sandbox and production
+### APNs development and production environments
 
-`APNS_USE_SANDBOX` picks exactly one of `api.sandbox.push.apple.com` /
-`api.push.apple.com` for *every* registered APNs device — there's no
-per-device split. A debug/TestFlight build's device token only works
-against sandbox; an App Store build's token only works against production.
-Flip it in `.env`, `docker compose up -d`. If every APNs device starts
-getting deleted right after registering (`BadDeviceToken` in the log), this
-mismatch is the first thing to check — see Troubleshooting.
+Current clients register `pushEnvironment=development|production` with each
+APNs device. The proxy keeps clients for both Apple endpoints open and routes
+each notification according to that stored value. Debug builds use
+development; Profile, Release, TestFlight, and App Store builds use
+production. Both kinds can therefore coexist in one deployment.
+
+`APNS_USE_SANDBOX` is only the fallback for registrations created before the
+per-device field existed. Set it to the environment of that legacy fleet and
+let current clients refresh their registrations. Once every APNs row has an
+explicit environment, changing the fallback has no effect on them.
 
 **Why the whole fleet doesn't actually get deregistered when this happens:**
 Apple can't tell "this token belongs to the other environment" apart from
 "this token is genuinely dead (uninstalled, expired)" — both come back as
 `BadDeviceToken`, and per the wire contract that's supposed to mean
 "forget this device, tell Nextcloud too" (`unknown`, which is destructive).
-Flip the environment against a fleet still registered under the old one and
-every device would fail that way at once. `App.deletion_breaker` (a
+Flip the fallback against a legacy fleet still registered under the old one
+and every legacy device would fail that way at once. `App.deletion_breaker` (a
 `RateLimiter` reused as a shared budget, not a per-caller gate — see
 `app/server.py::App.__init__`) caps *destructive* dead-token cleanup at
 10/hour across the whole fleet, however many separate `/notifications`
@@ -723,21 +726,18 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<host>/devices --data-b
    status=... reason=...` — common reasons: `BadDeviceToken` (also
    auto-deletes the device — expected after a reinstall on a new
    provisioning profile, but **also the exact symptom of a sandbox/production
-   mismatch**: a device token issued by a debug/TestFlight build only works
-   against `api.sandbox.push.apple.com`, a device token from an App Store
-   build only works against `api.push.apple.com`; this proxy only ever talks
-   to one of the two, chosen by `APNS_USE_SANDBOX`. If every device gets
-   silently deleted right after registering, this is almost certainly the
-   cause — check `APNS_USE_SANDBOX` against how the app was actually built,
-   not the other way around), `BadTopic` (check `APNS_TOPIC` matches the
+   mismatch**: a debug device token only works against
+   `api.sandbox.push.apple.com`, while Profile, Release, TestFlight, and App
+   Store tokens only work against `api.push.apple.com`. Current clients avoid
+   the mismatch by registering `pushEnvironment` per device. For a legacy row
+   with no environment, check `APNS_USE_SANDBOX` against how the app was built),
+   `BadTopic` (check `APNS_TOPIC` matches the
    app's actual bundle id), `TopicDisallowed` / `InvalidProviderToken` (Key
    ID or Team ID in `.env` is wrong, or the key was revoked).
-6. This proxy talks to exactly one APNs environment at a time
-   (`APNS_USE_SANDBOX`). It cannot simultaneously serve TestFlight/debug
-   builds and an App Store release — if both exist at once, that needs two
-   deployments (two ports/hosts) or a client-side environment field added to
-   the registration contract, neither of which exists today.
-6. If nothing shows up in this proxy's logs at all: the client likely never
+6. Confirm the stored `push_environment` matches the build: `development` for
+   debug and `production` for Profile, Release, TestFlight, or App Store. A
+   null value is a legacy registration and uses `APNS_USE_SANDBOX` as fallback.
+7. If nothing shows up in this proxy's logs at all: the client likely never
    registered `proxyServer` pointing at this service, or Nextcloud's own
    background job (`cron.php` / notify_push queue) isn't running, which is
    outside this proxy's control.
