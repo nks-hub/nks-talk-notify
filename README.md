@@ -212,18 +212,36 @@ from the client, not the server, so `/devices` keeps relying on the
 signature + key-pin above; it cannot use this key.
 
 **DoS/abuse guards, all in `app/server.py`:**
-- request bodies over 1 MiB get `413` without being parsed. This needs
-  `protocol_version = "HTTP/1.1"` on the handler: at the stdlib default
-  (`HTTP/1.0`), `handle_expect_100` is never invoked, so a client/proxy
-  sending `Expect: 100-continue` for a large upload never gets a
-  `100 Continue` and waits forever -- reproduced live as the Apache reverse
-  proxy in front of this service hanging indefinitely on a >1MiB POST,
-  tying up a shared Apache worker. Don't try to "optimize" this further by
-  rejecting *before* sending `100 Continue`: that also stops the hang, but
-  the live Apache proxy substitutes its own generic error page for the
-  early rejection instead of relaying it, so the client sees a `404`
-  instead of `413`. Let stdlib send `100 Continue` and reject in `do_POST`
-  as normal once the body arrives;
+- request bodies over 1 MiB (`MAX_BODY_BYTES`) get `413` without being
+  parsed. Getting that `413` to actually arrive at the client, through the
+  Apache/ISPConfig reverse proxy in front of this service, took three
+  separate fixes, all load-bearing -- removing any one of them regresses a
+  reproduced live failure, not a theoretical one:
+  1. `protocol_version = "HTTP/1.1"` on the handler. At the stdlib default
+     (`HTTP/1.0`), `handle_expect_100` is never invoked, so a client/proxy
+     sending `Expect: 100-continue` for a large upload never gets a
+     `100 Continue` and waits forever -- reproduced live as the reverse
+     proxy hanging indefinitely on a >1MiB POST, tying up a shared Apache
+     worker.
+  2. Reject *inside* `do_POST`, after stdlib's default `100 Continue`, not
+     before it. An earlier attempt rejected before sending `100 Continue`
+     at all -- that also stopped the hang, but the live proxy then
+     substituted its own generic error page for the early rejection
+     instead of relaying it, so the client saw a `404` instead of `413`.
+  3. Draining a *generous*, fixed amount of the rejected body
+     (`_DRAIN_CAP_BYTES`, 8 MiB) before responding, not a token amount.
+     `mod_proxy_http` writes the whole request body to us before it will
+     accept any response from us as valid; stopping too early (previously
+     tried: nothing, then 64 KiB) leaves it mid-write when we close, which
+     it reports as its own `502` instead of relaying our `413` --
+     reproduced live at 1.2 MiB and 2 MiB bodies with a 64 KiB cap, fixed by
+     widening it. The cap is still a fixed constant *we* choose, never the
+     client's declared `Content-Length` -- that's what keeps this bounded
+     rather than a reopened version of the same DoS. Bodies large enough to
+     exceed even the 8 MiB cap (tested at 10 MiB) still get the proxy's
+     generic error page instead of a clean `413`; the rate limiter below
+     bounds how often one source can trigger that, and no legitimate
+     client ever sends a body anywhere close to that size;
 - `POST /devices` is rate-limited per source IP (token bucket, 20 burst /
   20 per minute refill) — `429` past that;
 - `POST /notifications` has a looser per-IP bucket (120/120 per minute) for
@@ -364,7 +382,17 @@ that host) and holds the Let's Encrypt certificate. Adding a new public
 host with `apache_directives` doing a reverse proxy to
 `http://<docker-host-lan-ip>:<port>/`, not touching this repo or its
 Dockerfile at all. Don't hand-edit Apache vhosts directly on that host —
-ISPConfig owns and regenerates them.
+ISPConfig owns and regenerates them; the reference deployment's
+`apache_directives` were set through the ISPConfig Remote API, scoped to
+this one site only.
+
+That `apache_directives` block also sets `LimitRequestBody 1048576`
+(matching `MAX_BODY_BYTES`) as defense-in-depth at the proxy layer. On its
+own it did **not** fix the reverse-proxy body-size interaction described
+under Security model -- the real fix there is the widened drain cap in
+`app/server.py`. Keep both: the Apache-level limit protects requests that
+never should have started relaying at all, the app-level cap and drain
+handle everything that does.
 
 ### Recovery
 
