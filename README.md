@@ -488,6 +488,61 @@ No client-side change is needed — the key id/team id only affect how this
 proxy authenticates to Apple, not the wire contract with Nextcloud or the
 app.
 
+### Rotating the FCM service account
+
+1. Firebase Console → Project Settings → Service Accounts → Generate new
+   private key, for the same project (`FCM_PROJECT_ID`).
+2. Copy the new JSON to the host, e.g.
+   `/opt/nks-talk-notify/secrets/fcm-service-account-<date>.json`.
+3. Update `.env`: `FCM_SERVICE_ACCOUNT_HOST_PATH`.
+4. `docker compose up -d` (recreates the container with the new mount).
+5. Verify: `docker compose logs --tail 20` shows a clean start with no
+   `FCM is not configured` warning, then trigger a real notification and
+   confirm it arrives (or watch for a real OAuth2 exchange in the log —
+   see Live verification below).
+6. Once confirmed, delete/disable the old service account key in the
+   Firebase Console and remove the old JSON from the host.
+
+No client-side change is needed here either — same reasoning as the APNs
+key.
+
+### Switching APNs between sandbox and production
+
+`APNS_USE_SANDBOX` picks exactly one of `api.sandbox.push.apple.com` /
+`api.push.apple.com` for *every* registered APNs device — there's no
+per-device split. A debug/TestFlight build's device token only works
+against sandbox; an App Store build's token only works against production.
+Flip it in `.env`, `docker compose up -d`. If every APNs device starts
+getting deleted right after registering (`BadDeviceToken` in the log), this
+mismatch is the first thing to check — see Troubleshooting.
+
+### Rotating the FCM service account
+
+1. Firebase console → Project settings → Service accounts → Generate new
+   private key. The old key keeps working until you revoke it.
+2. Copy the JSON to the host next to the `.p8`, `chown` it to the container
+   user and `chmod 400`.
+3. Update `FCM_SERVICE_ACCOUNT_HOST_PATH` in `.env`, then
+   `docker compose up -d`.
+4. Verify from the logs that the OAuth2 exchange succeeds: a line for
+   `POST https://oauth2.googleapis.com/token` returning `200`. A `401` or
+   `invalid_grant` there means the key, the client email or the clock is
+   wrong — it is not a token problem.
+5. Delete the old key in the Google Cloud console once the new one is
+   confirmed, and remove the old JSON from the host.
+
+### Reading the logs
+
+Two things mislead everyone at least once:
+
+- **The container logs in UTC**, while the hosts around it run local time.
+  A line that looks two hours old is usually two minutes old. Compare
+  against `date -u`, not against your own clock.
+- **Every request shows the reverse proxy's address**, not the caller's,
+  because the access log prints the peer address. The rate limiter reads
+  `X-Forwarded-For` and does see the real client, but the access log does
+  not — do not conclude from it that traffic came from inside the network.
+
 ### Live verification against the running proxy
 
 `/health`'s device count is the only way anyone outside this repo can
@@ -495,23 +550,70 @@ confirm from the outside whether a *real* registration went through — the
 mobile teams read it too. A leftover synthetic device from a smoke test
 pollutes that signal for everyone, and is orphaned (Nextcloud never knows
 about a device that only exists in this proxy's DB), so nobody can safely
-delete it later without asking around.
+delete it later without asking around — losing a real device's row to a
+guess is worse than the clutter (it happened once during development).
 
-Rules for any one-off script that registers a real device against the live
+Rules for any one-off script that registers a device against the live
 proxy (`make_fake_device()` from `tests/conftest.py` or equivalent):
 
-- **Always pass a unique `preimage`.** The default is a fixed constant —
-  fine for pytest (each test gets a fresh in-memory DB), a repeat trap
-  against a real deployment (same preimage → same `deviceIdentifier` →
-  the *second* run collides with the first under the key pin, `403`).
-  `f'["smoketest-{time.time()}","1"]'.encode()` is enough.
+- **Always pass a `preimage` starting with a reserved marker no real
+  registration can ever produce**, e.g. `SMOKETEST:` — a real preimage is
+  always Nextcloud's own `[cloudId, tokenId]` JSON
+  (`PushController::registerDevice`), which never looks like that. Add a
+  run-unique suffix too, or repeated runs collide under the key pin
+  (`403`): `f'SMOKETEST:{time.time()}'.encode()`. This is what makes a
+  leftover row identifiable *without guessing* if a script dies before
+  cleanup — the point that mattered enough to cost a real device's row
+  once already.
 - **Clean up in the same script**, right after you're done, not "I'll
   delete it after": `DELETE /devices` with that device's own
   `deviceIdentifier` + `deviceIdentifierSignature`.
 - Nothing marks a synthetic device as synthetic server-side — there's no
   field for it and there shouldn't be (it'd be one more thing to keep
-  honest). The unique preimage *is* the marker: it lets you recognize your
-  own rows if a script dies before cleanup, without guessing whose they are.
+  honest). The reserved preimage prefix *is* the marker.
+
+The negative checks below don't register anything, so they're always safe
+to run without touching `/health`'s count:
+
+```bash
+# 401 without the subscription key (skip if NEXTCLOUD_SUBSCRIPTION_KEY is unset)
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<host>/notifications \
+  --data-urlencode 'notifications[0]={"deviceIdentifier":"x","pushTokenHash":"x","subject":"x","signature":"x"}'
+# → 401
+
+# 400 on a token matching neither APNs nor FCM shape
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<host>/devices \
+  --data-urlencode 'pushToken=not-a-valid-token!!' \
+  --data-urlencode 'deviceIdentifier=x' --data-urlencode 'deviceIdentifierSignature=x' --data-urlencode 'userPublicKey=x'
+# → 400 {"message": "INVALID_PUSH_TOKEN"}
+
+# 413 on a body over MAX_BODY_BYTES (1 MiB) -- must come back in well under
+# a second; if it hangs or comes back as a proxy-generated 502/404 instead
+# of our own JSON, the reverse-proxy interaction described under Security
+# model has regressed, not this check
+head -c 1100000 /dev/zero | tr '\0' 'a' > /tmp/big.txt
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<host>/devices --data-binary @/tmp/big.txt
+# → 413
+```
+
+### Reading the logs
+
+`docker compose logs` — timestamps are **UTC**, not local time; line up
+incidents against that, not wall clock. Every line logs the caller's
+address first: behind the reverse proxy that's normally the **proxy's own
+LAN IP** (`192.0.2.10` in the reference deployment), not the real
+internet client — `_client_ip()` uses `X-Forwarded-For` for rate-limiting
+decisions, but the stdlib access-log line itself always prints the raw
+socket peer. A real client IP, if you need one, is in the reverse proxy's
+own access log, not here.
+
+An FCM send logs two extra lines worth knowing apart: `POST
+https://oauth2.googleapis.com/token` is the JWT→access-token exchange
+(fails here = bad service account, wrong key, or Google-side auth
+problem); `POST https://fcm.googleapis.com/v1/projects/.../messages:send`
+is the actual push (fails here with a `4xx` = auth was fine, the
+*message* was rejected — see the FCM error-code table under Security
+model).
 
 ### Troubleshooting: notifications aren't arriving
 
