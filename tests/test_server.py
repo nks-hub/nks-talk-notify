@@ -543,6 +543,34 @@ def test_oversized_body_is_rejected(live_server):
         assert e.code == 413
 
 
+def test_oversized_body_rejected_before_reading_it_with_expect_100_continue(live_server):
+    """A reverse proxy (observed: Apache/mod_proxy_http) can hang forever if
+    we answer "100 Continue" and only reject afterwards -- reject in
+    handle_expect_100 itself, without ever asking the client for the body."""
+    import socket
+    from urllib.parse import urlsplit
+
+    from app.server import MAX_BODY_BYTES
+
+    base_url, _fake = live_server
+    parts = urlsplit(base_url)
+    oversized_len = MAX_BODY_BYTES + 1
+
+    with socket.create_connection((parts.hostname, parts.port), timeout=5) as sock:
+        sock.sendall(
+            f"POST /devices HTTP/1.1\r\n"
+            f"Host: {parts.netloc}\r\n"
+            f"Content-Length: {oversized_len}\r\n"
+            f"Expect: 100-continue\r\n"
+            f"Connection: close\r\n\r\n".encode()
+        )
+        # deliberately never send the body -- a correct server must not wait for it
+        sock.settimeout(5)
+        response = sock.recv(4096).decode()
+    assert response.startswith("HTTP/1.1 413"), response
+    assert "100 Continue" not in response
+
+
 def test_devices_rate_limit_returns_429(tmp_path, fake_device):
     """S3: the bucket capacity is small enough to hit within a single test."""
     base_url, fake, server, store = _start_live_server(tmp_path)

@@ -255,6 +255,11 @@ def _parse_notification_entries(form: dict) -> list[str]:
 def make_handler(app: App):
     class Handler(BaseHTTPRequestHandler):
         server_version = "nks-talk-notify/1.0"
+        # Required for stdlib to invoke handle_expect_100 at all (it gates on
+        # protocol_version >= "HTTP/1.1"); default HTTP/1.0 silently skips
+        # Expect: 100-continue handling entirely, which is what let the
+        # Apache-proxy deadlock happen in the first place.
+        protocol_version = "HTTP/1.1"
 
         def log_message(self, fmt: str, *args) -> None:  # quiet default stderr access log
             log.info("%s - %s", self.address_string(), fmt % args)
@@ -267,6 +272,11 @@ def make_handler(app: App):
             self.end_headers()
             if payload and write_body:
                 self.wfile.write(payload)
+            # protocol_version is HTTP/1.1 only so stdlib will run
+            # handle_expect_100 (see there) -- this service has no need for
+            # keep-alive, and not closing left half-finished connections
+            # hanging after every response.
+            self.close_connection = True
 
         def _read_form(self) -> dict:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -280,6 +290,23 @@ def make_handler(app: App):
                 if not chunk:
                     break
                 remaining -= len(chunk)
+
+        def handle_expect_100(self) -> bool:
+            # Default stdlib behaviour always answers "Expect: 100-continue"
+            # with 100 first, THEN runs do_POST -- so an oversized body is
+            # only rejected *after* promising the client "go ahead, upload
+            # it". Through a buffering reverse proxy (observed with the
+            # Apache/ISPConfig proxy in front of this service) that promise-
+            # then-reject sequence can hang the proxy indefinitely instead of
+            # relaying our 413, tying up a shared Apache worker -- a DoS
+            # surface on infrastructure this service doesn't own. Reject
+            # up front, as the spec allows, when we already know from
+            # Content-Length alone that the body is too big.
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            if length > MAX_BODY_BYTES:
+                self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"message": "BODY_TOO_LARGE"})  # also closes
+                return False
+            return super().handle_expect_100()
 
         def _client_ip(self) -> str:
             # Deployed behind the ISPConfig/Apache reverse proxy on gateway-host,
@@ -307,10 +334,9 @@ def make_handler(app: App):
             path = urlsplit(self.path).path
 
             length = int(self.headers.get("Content-Length", "0") or "0")
-            if length > MAX_BODY_BYTES:  # S3
-                self._drain(length)  # avoid an RST racing our response (esp. on Windows)
+            if length > MAX_BODY_BYTES:  # S3 -- normally caught earlier by handle_expect_100, this
+                self._drain(length)  # covers requests that skip Expect: 100-continue entirely
                 self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"message": "BODY_TOO_LARGE"})
-                self.close_connection = True
                 return
 
             if path == "/devices":
