@@ -191,11 +191,21 @@ class App:
         device_identifier = _first(form, "deviceIdentifier")
         signature = _first(form, "deviceIdentifierSignature")
         public_key = _first(form, "userPublicKey")
+        push_environment = _first(form, "pushEnvironment")
         if not (push_token and device_identifier and signature and public_key):
             return HTTPStatus.BAD_REQUEST, {"message": "MISSING_FIELDS"}
 
-        if token_kind(push_token) is None:  # S2: path-injection guard, cheap so check first
+        kind = token_kind(push_token)
+        if kind is None:  # S2: path-injection guard, cheap so check first
             return HTTPStatus.BAD_REQUEST, {"message": "INVALID_PUSH_TOKEN"}
+        if kind == "apns" and push_environment not in (
+            None,
+            apns.DEVELOPMENT_ENVIRONMENT,
+            apns.PRODUCTION_ENVIRONMENT,
+        ):
+            return HTTPStatus.BAD_REQUEST, {"message": "INVALID_PUSH_ENVIRONMENT"}
+        if kind == "fcm" and push_environment is not None:
+            return HTTPStatus.BAD_REQUEST, {"message": "INVALID_PUSH_ENVIRONMENT"}
 
         if not crypto.verify_device_identifier_signature(
             device_identifier_b64=device_identifier, signature_b64=signature, public_key_pem=public_key
@@ -208,6 +218,7 @@ class App:
                 user_public_key=public_key,
                 push_token=push_token,
                 push_token_hash=self.push_token_hash(push_token),
+                push_environment=push_environment,
             )
         except PublicKeyMismatch:
             # S6: 403 "unauthorized for this identifier", not 409 -- we don't
@@ -290,7 +301,13 @@ class App:
 
             kind = token_kind(device.push_token)
             if kind == "apns":
-                forget = self._send_via_apns(device.push_token, subject, nc_type, nc_priority)
+                forget = self._send_via_apns(
+                    device.push_token,
+                    subject,
+                    nc_type,
+                    nc_priority,
+                    device.push_environment,
+                )
             elif kind == "fcm":
                 forget = self._send_via_fcm(device.push_token, subject, nc_priority)
             else:
@@ -305,7 +322,7 @@ class App:
                 else:
                     log.error(
                         "deletion breaker tripped -- refusing to forget %s (dead-token deletions exceeded the "
-                        "hourly budget). Likely cause: APNS_USE_SANDBOX or the FCM credentials don't match what "
+                        "hourly budget). Likely cause: the APNs environment or FCM credentials don't match what "
                         "your devices actually registered under -- check that before assuming devices are gone.",
                         device_identifier,
                     )
@@ -314,7 +331,14 @@ class App:
 
         return HTTPStatus.OK, {"unknown": unknown, "failed": failed}
 
-    def _send_via_apns(self, device_token: str, subject: str, nc_type: str, nc_priority: str) -> Optional[bool]:
+    def _send_via_apns(
+        self,
+        device_token: str,
+        subject: str,
+        nc_type: str,
+        nc_priority: str,
+        push_environment: Optional[str],
+    ) -> Optional[bool]:
         """Returns True if the device should be forgotten, False if delivered
         fine, None on failure that doesn't warrant forgetting it (or if APNs
         isn't configured -- own env vars unset while an APNs token is somehow
@@ -324,7 +348,13 @@ class App:
             return None
         push_type, priority = apns.push_type_and_priority(nc_type, nc_priority)
         payload = apns.build_payload(push_type=push_type, encrypted_subject_b64=subject)
-        result = self.apns_client.send(device_token=device_token, payload=payload, push_type=push_type, priority=priority)
+        result = self.apns_client.send(
+            device_token=device_token,
+            payload=payload,
+            push_type=push_type,
+            priority=priority,
+            environment=push_environment,
+        )
         if result.ok:
             return False
         if result.should_forget_device:

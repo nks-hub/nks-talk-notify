@@ -35,6 +35,7 @@ class Device:
     user_public_key: str
     push_token: str
     push_token_hash: str
+    push_environment: Optional[str]
     created_at: str
     updated_at: str
 
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS devices (
     user_public_key   TEXT NOT NULL,
     push_token        TEXT NOT NULL,
     push_token_hash   TEXT NOT NULL,
+    push_environment  TEXT,
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
 );
@@ -64,6 +66,13 @@ class DeviceStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(devices)")
+        }
+        if "push_environment" not in columns:
+            self._conn.execute(
+                "ALTER TABLE devices ADD COLUMN push_environment TEXT"
+            )
         self._conn.commit()
         try:
             os.chmod(db_path, 0o600)  # S8: push tokens are sensitive, owner-only
@@ -87,13 +96,19 @@ class DeviceStore:
     def get(self, device_identifier: str) -> Optional[Device]:
         row = self._conn.execute(
             "SELECT device_identifier, user_public_key, push_token, push_token_hash,"
-            " created_at, updated_at FROM devices WHERE device_identifier = ?",
+            " push_environment, created_at, updated_at FROM devices WHERE device_identifier = ?",
             (device_identifier,),
         ).fetchone()
         return Device(*row) if row else None
 
     def register(
-        self, *, device_identifier: str, user_public_key: str, push_token: str, push_token_hash: str
+        self,
+        *,
+        device_identifier: str,
+        user_public_key: str,
+        push_token: str,
+        push_token_hash: str,
+        push_environment: Optional[str] = None,
     ) -> Device:
         """Insert a new device, or refresh push_token for an existing one.
 
@@ -114,15 +129,27 @@ class DeviceStore:
         with self._write() as cur:
             cur.execute(
                 """
-                INSERT INTO devices (device_identifier, user_public_key, push_token, push_token_hash, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO devices (
+                    device_identifier, user_public_key, push_token,
+                    push_token_hash, push_environment, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(device_identifier) DO UPDATE SET
                     push_token = excluded.push_token,
                     push_token_hash = excluded.push_token_hash,
+                    push_environment = excluded.push_environment,
                     updated_at = excluded.updated_at
                 WHERE devices.user_public_key = excluded.user_public_key
                 """,
-                (device_identifier, user_public_key, push_token, push_token_hash, now, now),
+                (
+                    device_identifier,
+                    user_public_key,
+                    push_token,
+                    push_token_hash,
+                    push_environment,
+                    now,
+                    now,
+                ),
             )
             if cur.rowcount == 0:
                 raise PublicKeyMismatch(device_identifier)

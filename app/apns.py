@@ -21,6 +21,8 @@ from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 PROD_HOST = "https://api.push.apple.com"
 SANDBOX_HOST = "https://api.sandbox.push.apple.com"
+DEVELOPMENT_ENVIRONMENT = "development"
+PRODUCTION_ENVIRONMENT = "production"
 
 # Apple invalidates provider tokens older than 1h and rate-limits how often
 # a new one may be minted; refresh comfortably inside that window.
@@ -93,11 +95,21 @@ class ApnsClient:
     def __init__(self, key_path: str, key_id: str, team_id: str, topic: str, use_sandbox: bool = False):
         self._auth = ApnsAuthTokenFactory(key_path, key_id, team_id)
         self._topic = topic
-        host = SANDBOX_HOST if use_sandbox else PROD_HOST
-        self._client = httpx.Client(base_url=host, http2=True, timeout=10.0)
+        self._default_environment = (
+            DEVELOPMENT_ENVIRONMENT if use_sandbox else PRODUCTION_ENVIRONMENT
+        )
+        self._clients = {
+            DEVELOPMENT_ENVIRONMENT: httpx.Client(
+                base_url=SANDBOX_HOST, http2=True, timeout=10.0
+            ),
+            PRODUCTION_ENVIRONMENT: httpx.Client(
+                base_url=PROD_HOST, http2=True, timeout=10.0
+            ),
+        }
 
     def close(self) -> None:
-        self._client.close()
+        for client in self._clients.values():
+            client.close()
 
     def send(
         self,
@@ -107,7 +119,11 @@ class ApnsClient:
         push_type: str,
         priority: int,
         collapse_id: Optional[str] = None,
+        environment: Optional[str] = None,
     ) -> ApnsResult:
+        selected_environment = environment or self._default_environment
+        if selected_environment not in self._clients:
+            raise ValueError("unknown APNs environment")
         topic = self._topic + ".voip" if push_type == "voip" else self._topic
         headers = {
             "authorization": f"bearer {self._auth.token()}",
@@ -118,7 +134,9 @@ class ApnsClient:
         if collapse_id:
             headers["apns-collapse-id"] = collapse_id[:64]
 
-        response = self._client.post(f"/3/device/{device_token}", headers=headers, json=payload)
+        response = self._clients[selected_environment].post(
+            f"/3/device/{device_token}", headers=headers, json=payload
+        )
         apns_id = response.headers.get("apns-id")
         reason = None
         if response.status_code != 200:

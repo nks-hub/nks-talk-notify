@@ -121,3 +121,51 @@ def test_apns_result_keeps_device_on_other_errors():
     assert not result.should_forget_device
     result2 = apns.ApnsResult(status_code=429, apns_id=None, reason="TooManyRequests")
     assert not result2.should_forget_device
+
+
+def test_client_selects_endpoint_per_registered_environment(ec_key_path):
+    path, _key = ec_key_path
+    client = apns.ApnsClient(
+        str(path),
+        key_id="k",
+        team_id="t",
+        topic="com.example.app",
+        use_sandbox=True,
+    )
+
+    class FakeResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+    class FakeHttpClient:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, path, **kwargs):
+            self.calls.append((path, kwargs))
+            return FakeResponse()
+
+        def close(self):
+            pass
+
+    for original in client._clients.values():
+        original.close()
+    development = FakeHttpClient()
+    production = FakeHttpClient()
+    client._clients = {
+        apns.DEVELOPMENT_ENVIRONMENT: development,
+        apns.PRODUCTION_ENVIRONMENT: production,
+    }
+    try:
+        client.send(
+            device_token="aa" * 32,
+            payload={"aps": {}},
+            push_type="background",
+            priority=5,
+            environment=apns.PRODUCTION_ENVIRONMENT,
+        )
+    finally:
+        client.close()
+
+    assert development.calls == []
+    assert len(production.calls) == 1

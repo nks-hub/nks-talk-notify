@@ -17,16 +17,22 @@ def test_register_new_device(store):
         device_identifier="id-1", user_public_key="pubkey-1", push_token="token-1", push_token_hash="hash-1"
     )
     assert device.device_identifier == "id-1"
+    assert device.push_environment is None
     assert store.count() == 1
 
 
 def test_register_same_identifier_updates_push_token(store):
     store.register(device_identifier="id-1", user_public_key="pubkey-1", push_token="old-token", push_token_hash="old-hash")
     updated = store.register(
-        device_identifier="id-1", user_public_key="pubkey-1", push_token="new-token", push_token_hash="new-hash"
+        device_identifier="id-1",
+        user_public_key="pubkey-1",
+        push_token="new-token",
+        push_token_hash="new-hash",
+        push_environment="production",
     )
     assert updated.push_token == "new-token"
     assert updated.push_token_hash == "new-hash"
+    assert updated.push_environment == "production"
     assert store.count() == 1  # still one row, not a duplicate
 
 
@@ -93,3 +99,36 @@ def test_concurrent_first_registrations_under_different_keys_never_corrupt(store
     stored = store.get("shared-id")
     assert stored.user_public_key == f"pubkey-{winner}"
     assert stored.push_token == f"token-{winner}"  # never another thread's token
+
+
+def test_existing_database_is_migrated_with_push_environment(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old-devices.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE devices (
+            device_identifier TEXT PRIMARY KEY,
+            user_public_key TEXT NOT NULL,
+            push_token TEXT NOT NULL,
+            push_token_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    connection.close()
+
+    migrated = DeviceStore(str(path))
+    try:
+        device = migrated.register(
+            device_identifier="id-1",
+            user_public_key="pubkey-1",
+            push_token="token-1",
+            push_token_hash="hash-1",
+            push_environment="development",
+        )
+        assert device.push_environment == "development"
+    finally:
+        migrated.close()
