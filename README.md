@@ -212,7 +212,18 @@ from the client, not the server, so `/devices` keeps relying on the
 signature + key-pin above; it cannot use this key.
 
 **DoS/abuse guards, all in `app/server.py`:**
-- request bodies over 1 MiB get `413` without being parsed;
+- request bodies over 1 MiB get `413` without being parsed. This needs
+  `protocol_version = "HTTP/1.1"` on the handler: at the stdlib default
+  (`HTTP/1.0`), `handle_expect_100` is never invoked, so a client/proxy
+  sending `Expect: 100-continue` for a large upload never gets a
+  `100 Continue` and waits forever -- reproduced live as the Apache reverse
+  proxy in front of this service hanging indefinitely on a >1MiB POST,
+  tying up a shared Apache worker. Don't try to "optimize" this further by
+  rejecting *before* sending `100 Continue`: that also stops the hang, but
+  the live Apache proxy substitutes its own generic error page for the
+  early rejection instead of relaying it, so the client sees a `404`
+  instead of `413`. Let stdlib send `100 Continue` and reject in `do_POST`
+  as normal once the body arrives;
 - `POST /devices` is rate-limited per source IP (token bucket, 20 burst /
   20 per minute refill) — `429` past that;
 - `POST /notifications` has a looser per-IP bucket (120/120 per minute) for
