@@ -39,6 +39,18 @@ class InvalidPublicKey(ValueError):
     pass
 
 
+# Nextcloud's identity-proof keys are RSA-2048 in practice, but nothing here
+# actually requires that exact size. Bound it instead of trusting "any RSA
+# key parses": under 2048 bits is weak enough to be a real crack target, and
+# with no upper bound a submitted key of a few hundred KB makes every
+# verify() on it disproportionately expensive -- registration is otherwise
+# free to attempt (see README Security model), so this is real amplification,
+# not a theoretical one. 8192 is generous headroom above any real identity
+# key while still bounding the cost.
+_MIN_RSA_KEY_BITS = 2048
+_MAX_RSA_KEY_BITS = 8192
+
+
 def load_rsa_public_key(pem: str) -> rsa.RSAPublicKey:
     try:
         key = serialization.load_pem_public_key(pem.encode("utf-8"))
@@ -46,6 +58,8 @@ def load_rsa_public_key(pem: str) -> rsa.RSAPublicKey:
         raise InvalidPublicKey(str(exc)) from exc
     if not isinstance(key, rsa.RSAPublicKey):
         raise InvalidPublicKey("not an RSA public key")
+    if not (_MIN_RSA_KEY_BITS <= key.key_size <= _MAX_RSA_KEY_BITS):
+        raise InvalidPublicKey(f"RSA key size {key.key_size} outside [{_MIN_RSA_KEY_BITS}, {_MAX_RSA_KEY_BITS}]")
     return key
 
 

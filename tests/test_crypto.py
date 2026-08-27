@@ -25,6 +25,30 @@ def test_device_identifier_signature_rejects_wrong_key():
     )
 
 
+def test_load_rsa_public_key_rejects_undersized_key():
+    """A key that parses fine as RSA but is too weak to be a real identity
+    key (and, with no floor at all, too cheap to spam registrations with)."""
+    import cryptography.hazmat.primitives.asymmetric.rsa as rsa_mod
+    import cryptography.hazmat.primitives.serialization as ser
+
+    weak_key = rsa_mod.generate_private_key(public_exponent=65537, key_size=1024)
+    weak_pem = weak_key.public_key().public_bytes(
+        ser.Encoding.PEM, ser.PublicFormat.SubjectPublicKeyInfo
+    ).decode()
+
+    try:
+        crypto.load_rsa_public_key(weak_pem)
+        assert False, "expected InvalidPublicKey for a 1024-bit key"
+    except crypto.InvalidPublicKey:
+        pass
+
+    # and the higher-level verify functions must degrade to False, not raise
+    assert not crypto.verify_device_identifier_signature(
+        device_identifier_b64=base64.b64encode(b"x" * 64).decode(), signature_b64=base64.b64encode(b"y").decode(),
+        public_key_pem=weak_pem,
+    )
+
+
 def test_device_identifier_signature_rejects_tampered_digest():
     device = make_fake_device()
     tampered = base64.b64encode(b"x" * 64).decode()
