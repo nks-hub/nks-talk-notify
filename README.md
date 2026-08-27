@@ -319,10 +319,21 @@ app.
 5. APNs-side rejection shows up in this proxy's logs as `APNs push failed:
    status=... reason=...` — common reasons: `BadDeviceToken` (also
    auto-deletes the device — expected after a reinstall on a new
-   provisioning profile), `BadTopic` (check `APNS_TOPIC` matches the app's
-   actual bundle id and that `APNS_USE_SANDBOX` matches how the app was
-   built), `TopicDisallowed` / `InvalidProviderToken` (Key ID or Team ID in
-   `.env` is wrong, or the key was revoked).
+   provisioning profile, but **also the exact symptom of a sandbox/production
+   mismatch**: a device token issued by a debug/TestFlight build only works
+   against `api.sandbox.push.apple.com`, a device token from an App Store
+   build only works against `api.push.apple.com`; this proxy only ever talks
+   to one of the two, chosen by `APNS_USE_SANDBOX`. If every device gets
+   silently deleted right after registering, this is almost certainly the
+   cause — check `APNS_USE_SANDBOX` against how the app was actually built,
+   not the other way around), `BadTopic` (check `APNS_TOPIC` matches the
+   app's actual bundle id), `TopicDisallowed` / `InvalidProviderToken` (Key
+   ID or Team ID in `.env` is wrong, or the key was revoked).
+6. This proxy talks to exactly one APNs environment at a time
+   (`APNS_USE_SANDBOX`). It cannot simultaneously serve TestFlight/debug
+   builds and an App Store release — if both exist at once, that needs two
+   deployments (two ports/hosts) or a client-side environment field added to
+   the registration contract, neither of which exists today.
 6. If nothing shows up in this proxy's logs at all: the client likely never
    registered `proxyServer` pointing at this service, or Nextcloud's own
    background job (`cron.php` / notify_push queue) isn't running, which is
