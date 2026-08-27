@@ -543,10 +543,23 @@ def test_oversized_body_is_rejected(live_server):
         assert e.code == 413
 
 
-def test_oversized_body_rejected_before_reading_it_with_expect_100_continue(live_server):
-    """A reverse proxy (observed: Apache/mod_proxy_http) can hang forever if
-    we answer "100 Continue" and only reject afterwards -- reject in
-    handle_expect_100 itself, without ever asking the client for the body."""
+def test_oversized_body_with_expect_100_continue_gets_413_not_a_hang(live_server):
+    """Regression test for a real production incident: with protocol_version
+    left at the stdlib default (HTTP/1.0), handle_expect_100 is never
+    invoked, so a client/proxy sending "Expect: 100-continue" never gets a
+    "100 Continue" and waits forever -- reproduced live as the Apache reverse
+    proxy in front of this service hanging indefinitely on a >1MiB POST,
+    tying up a shared Apache worker (a DoS surface on infra this service
+    doesn't own). protocol_version = "HTTP/1.1" makes stdlib answer "100
+    Continue" immediately; do_POST's existing drain-then-413 logic handles
+    the rest once the (still-oversized) body arrives.
+
+    (An earlier fix rejected *before* sending 100 Continue at all, which also
+    stopped the hang -- but made the live Apache proxy substitute its own
+    generic error page for our 413 instead of relaying it. Letting stdlib
+    send 100 Continue first and rejecting in do_POST as normal avoided that
+    with no functional downside, so that's what's shipped.)
+    """
     import socket
     from urllib.parse import urlsplit
 
@@ -561,14 +574,17 @@ def test_oversized_body_rejected_before_reading_it_with_expect_100_continue(live
             f"POST /devices HTTP/1.1\r\n"
             f"Host: {parts.netloc}\r\n"
             f"Content-Length: {oversized_len}\r\n"
-            f"Expect: 100-continue\r\n"
-            f"Connection: close\r\n\r\n".encode()
+            f"Expect: 100-continue\r\n\r\n".encode()
         )
-        # deliberately never send the body -- a correct server must not wait for it
         sock.settimeout(5)
-        response = sock.recv(4096).decode()
-    assert response.startswith("HTTP/1.1 413"), response
-    assert "100 Continue" not in response
+        continue_line = sock.recv(4096).decode()
+        assert "100 Continue" in continue_line, continue_line
+
+        sock.sendall(b"a" * oversized_len)
+        response = b""
+        while b"\r\n\r\n" not in response:
+            response += sock.recv(4096)
+    assert response.decode().startswith("HTTP/1.1 413")
 
 
 def test_devices_rate_limit_returns_429(tmp_path, fake_device):
