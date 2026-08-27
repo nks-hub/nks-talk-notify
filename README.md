@@ -238,7 +238,15 @@ What actually stops a hijack is **first-write pinning**: `DeviceStore`
 rejects any later registration of an already-known `deviceIdentifier` under
 a different `userPublicKey` (`403 Forbidden`). A device can freely refresh
 its `pushToken` (reinstall, token rotation) as long as it keeps proving
-ownership of the *original* key. (This returns `403`, not the push-v2 `409`
+ownership of the *original* key. The check and the write are one atomic SQL
+statement (`INSERT ... ON CONFLICT ... DO UPDATE ... WHERE
+devices.user_public_key = excluded.user_public_key`, `app/db.py::DeviceStore.register`)
+— it used to be a separate `SELECT` before the `INSERT`, which let two
+concurrent first-registrations under different keys both pass the check
+before either had written anything (reproduced live: 7 of 8 concurrent
+attempts "won" when only one should have;
+`tests/test_db.py::test_concurrent_first_registrations_under_different_keys_never_corrupt`).
+(This returns `403`, not the push-v2 `409`
 "conflict, retry with `cloudId`" — this proxy doesn't implement the
 `cloudId` retry flow, so `409` would tell the client to retry something that
 can never succeed. `403` "unauthorized for this identifier" is honest about
@@ -258,6 +266,32 @@ time, which the current wire contract (step 2 above) does not include.
 Documented here rather than faked: implementing this would need a protocol
 extension on the client side, out of scope for this repo alone.
 
+**`userPublicKey` is bounds-checked, not just "does it parse as RSA".**
+`crypto.load_rsa_public_key` rejects anything outside 2048-8192 bits
+(`app/crypto.py::_MIN_RSA_KEY_BITS`/`_MAX_RSA_KEY_BITS`). Below 2048 is a
+real crack target, not just theoretically weaker; above 8192 makes every
+signature verify against that key disproportionately expensive, and
+registration is free to attempt (no auth gate before the signature check —
+see above), so an oversized key is a real CPU-amplification knob, not a
+hypothetical one. 8192 is generous headroom above any real identity-proof
+key Nextcloud actually issues.
+
+**Deliberately not built: per-key registration quotas or storage
+cleanup.** An attacker with an unlimited supply of keypairs can still
+register an unlimited number of rows (disk fill). Not adding a cap here:
+every legitimate row already requires a signature (an actual asymmetric
+keypair, not a free-form string), so the cost-per-row for an attacker is
+one RSA keygen — cheap, but not free, and nothing this proxy has ever
+logged suggests it's been tried. A quota needs a policy decision this
+proxy can't make unilaterally (quota per what — IP? there's no stable
+per-*user* identity available at `POST /devices` time, see the squatting
+paragraph above) and its own abuse surface (a cap enables a denial trigger
+against a legitimate user who lost and re-registers many devices). Cheapest
+real mitigation if this becomes a live problem: disk-usage alerting on the
+container volume plus a manual `DELETE FROM devices WHERE created_at <
+...` sweep, not new code — revisit if `GET /health`'s device count ever
+grows in a way that isn't explained by real registrations.
+
 **Notification delivery (`POST /notifications`).** By default, no shared
 secret. The `signature` check against the pinned `userPublicKey` is the
 entire authentication for this endpoint: only someone holding the
@@ -269,13 +303,35 @@ exactly this: `Push::sendNotificationsToProxies()` sends an
 server's `subscription_aware_server` app config value. Set
 `NEXTCLOUD_SUBSCRIPTION_KEY` to that value and every `/notifications`
 request without a matching header gets `401` (`hmac.compare_digest`, no
-timing side-channel). Leave it unset only for first bring-up — the process
-logs a warning on startup and the endpoint stays reachable by anyone who can
-route to it. **This header is never sent to `/devices`** — that call comes
-from the client, not the server, so `/devices` keeps relying on the
-signature + key-pin above; it cannot use this key.
+timing side-channel). **Fails closed when unset**: the process logs a
+warning on startup, and every `/notifications` call gets `401` until you
+set it — a missing/misconfigured key must never be equivalent to "no auth
+needed" (a strict `if key and not hmac.compare_digest(...)` used to allow
+exactly that; flipped to `if not key or not hmac.compare_digest(...)`).
+`/devices` is unaffected either way and keeps working during bring-up: it's
+never gated by this key at all — see below. **This header is never sent to
+`/devices`** — that call comes from the client, not the server, so
+`/devices` keeps relying on the signature + key-pin above; it cannot use
+this key.
 
 **DoS/abuse guards, all in `app/server.py`:**
+- `Content-Length` is validated before anything reads a body: missing means
+  0, non-numeric or **negative is rejected outright** (`400`). `int()` alone
+  accepts `"-1"` happily, and `self.rfile.read(-1)` means "read until EOF"
+  in Python, not "no body" -- an unauthenticated client sending a negative
+  `Content-Length` turned the size check below (`length > MAX_BODY_BYTES`,
+  false for `-1`) into a request that holds a worker thread open until the
+  peer closes on its own, i.e. never (`Handler._content_length`,
+  reproduced live and in `test_negative_content_length_is_rejected_not_read_forever`).
+  `DELETE /devices` goes through the identical check (`Handler._validate_length`)
+  and the same per-IP bucket as `POST /devices` -- it used to read a body
+  with neither;
+- the handler also sets a 10s socket `timeout` (stdlib
+  `StreamRequestHandler`, applies to every blocking read on the connection,
+  not just the request line) -- `ThreadingHTTPServer` has no cap on
+  concurrent threads, so without this a client that opens a connection and
+  never finishes sending holds a thread open indefinitely regardless of
+  Content-Length;
 - request bodies over 1 MiB (`MAX_BODY_BYTES`) get `413` without being
   parsed. Getting that `413` to actually arrive at the client, through the
   Apache/ISPConfig reverse proxy in front of this service, took three
@@ -306,33 +362,53 @@ signature + key-pin above; it cannot use this key.
      generic error page instead of a clean `413`; the rate limiter below
      bounds how often one source can trigger that, and no legitimate
      client ever sends a body anywhere close to that size;
-- `POST /devices` is rate-limited per source IP (token bucket, 20 burst /
-  20 per minute refill) — `429` past that;
-- `POST /notifications` has a looser per-IP bucket (120/120 per minute) for
-  the same reason, since real Nextcloud traffic can burst; behind the
-  reverse proxy "per IP" effectively means "per proxy hop" unless
-  `X-Forwarded-For` carries the real client, which this proxy reads if
-  present;
+- `POST /devices` (and `DELETE /devices`, same bucket) is rate-limited per
+  source IP (token bucket, 20 burst / 20 per minute refill) — `429` past
+  that; `POST /notifications` has a looser per-IP bucket (120/120 per
+  minute) for the same reason, since real Nextcloud traffic can burst. Each
+  `RateLimiter`'s bucket dict is itself bounded: a bucket only gets evicted
+  once it's both back at full capacity and idle an hour, so evicting one is
+  exactly equivalent to it never having existed — otherwise a caller cycling
+  through distinct keys grows that dict forever;
+- **`X-Forwarded-For` is only trusted from `TRUSTED_PROXY_IP`** (the reverse
+  proxy in front of this service), and only its **last** entry. Unset (the
+  default) means never trust it, rate-limit by the raw TCP peer instead.
+  Two separate mistakes here, both real: trusting the header from *any*
+  peer means anyone can put a fresh fake IP in it per request and dodge
+  every limit; and even from the *real* proxy, `mod_proxy_http` **appends**
+  the genuine peer to whatever `X-Forwarded-For` the client already sent
+  rather than replacing it, so the first entry can still be
+  attacker-supplied — only the last one is what the trusted hop itself
+  added (`Handler._client_ip`);
 - `subject` must be exactly 344 base64 chars (an RSA-2048 ciphertext is
   always exactly 256 bytes) — anything else is rejected before spending a
   public-key verify on it;
 - a batch is capped at 100 `notifications[N]` entries; anything past the
   cap is not processed and counts as `failed`, so an oversized batch is
   visible instead of silently truncated;
-- `pushToken` must match `^[0-9a-f]{64}$` (lowercase only, to stay
-  consistent with the sha512 hex Nextcloud itself requires for
-  `pushTokenHash`) — this closes off `apns.py`'s
-  `f"/3/device/{device_token}"` as a path-injection vector, since anyone
-  with a self-consistent signature (see above) can reach `POST /devices`
-  from any Nextcloud server, not just this deployment's own.
+- `pushToken` must match one of two shapes before it's ever touched by
+  `apns.py`'s `f"/3/device/{device_token}"` or handed to FCM, closing off
+  path injection: an APNs token is `^(?:[0-9a-f]{2}){32,100}$` (64-200
+  lowercase hex chars — real APNs tokens vary in length, unlike the fixed
+  64-char sha512 hex Nextcloud uses for `pushTokenHash`, so this is
+  deliberately wider than that), an FCM token is
+  `^[A-Za-z0-9_:-]{32,4096}$`. `token_kind()` tries the APNs pattern first
+  since it's the narrower one — FCM's charset is technically a superset
+  that would also match plain hex.
 
-**Replay.** The native protocol has no nonce or timestamp, so a captured
-`notifications[N]` entry is replayable indefinitely on its own. Rather than
-extend the wire format (breaking compatibility with the real Nextcloud
-server), this proxy dedupes by `(deviceIdentifier, signature)` within a
-5-minute TTL window — a repeat within that window is silently dropped
-(counted as neither `failed` nor `unknown`, i.e. treated as already
-delivered) instead of triggering a second APNs push.
+**Replay is a Nextcloud protocol property, not a bug this proxy
+introduces or can unilaterally fix.** The wire format
+(`deviceIdentifier`/`subject`/`signature`) has no nonce or timestamp
+anywhere upstream — Nextcloud's own push proxy has exactly the same
+exposure, since the signature alone is what authenticates a
+`notifications[N]` entry. Extending the format would break compatibility
+with the real Nextcloud server, which is not this proxy's protocol to
+change. What we *do* control is bounding the blast radius: dedupe by
+`(deviceIdentifier, signature)` within a 5-minute TTL, so a captured entry
+can be replayed at most once per window rather than indefinitely. A
+repeat within that window is silently dropped (counted as neither
+`failed` nor `unknown`, i.e. treated as already delivered) instead of
+triggering a second APNs push.
 
 **Storage.** `push_token` (the real APNs device token) is stored in
 cleartext SQLite, file permissions restricted to the container user
