@@ -488,6 +488,31 @@ No client-side change is needed — the key id/team id only affect how this
 proxy authenticates to Apple, not the wire contract with Nextcloud or the
 app.
 
+### Live verification against the running proxy
+
+`/health`'s device count is the only way anyone outside this repo can
+confirm from the outside whether a *real* registration went through — the
+mobile teams read it too. A leftover synthetic device from a smoke test
+pollutes that signal for everyone, and is orphaned (Nextcloud never knows
+about a device that only exists in this proxy's DB), so nobody can safely
+delete it later without asking around.
+
+Rules for any one-off script that registers a real device against the live
+proxy (`make_fake_device()` from `tests/conftest.py` or equivalent):
+
+- **Always pass a unique `preimage`.** The default is a fixed constant —
+  fine for pytest (each test gets a fresh in-memory DB), a repeat trap
+  against a real deployment (same preimage → same `deviceIdentifier` →
+  the *second* run collides with the first under the key pin, `403`).
+  `f'["smoketest-{time.time()}","1"]'.encode()` is enough.
+- **Clean up in the same script**, right after you're done, not "I'll
+  delete it after": `DELETE /devices` with that device's own
+  `deviceIdentifier` + `deviceIdentifierSignature`.
+- Nothing marks a synthetic device as synthetic server-side — there's no
+  field for it and there shouldn't be (it'd be one more thing to keep
+  honest). The unique preimage *is* the marker: it lets you recognize your
+  own rows if a script dies before cleanup, without guessing whose they are.
+
 ### Troubleshooting: notifications aren't arriving
 
 1. `curl https://<public-host>/health` — if this fails, it's a reverse
