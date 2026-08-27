@@ -27,9 +27,14 @@ log = logging.getLogger("nks-talk-notify")
 
 _NOTIFICATION_KEY_RE = re.compile(r"^notifications\[(\d+)\]$")
 
-# S2: lowercase hex only -- must match exactly how the client hashes it for
-# Nextcloud's own pushTokenHash, or the two never agree on the same device.
-_APNS_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+# S2: charset stays strict (lowercase hex only -- matches how the client
+# hashes it for Nextcloud's own pushTokenHash, and closes the path-injection
+# vector into apns.py's f"/3/device/{device_token}"), but the length must
+# NOT be pinned to the historical 32-byte/64-char token: Apple's own docs
+# say device token length isn't guaranteed stable, and real devices have
+# been observed handing back 160-char (80-byte) tokens. 64-200 hex chars,
+# always an even count of hex digits (whole bytes).
+_APNS_TOKEN_RE = re.compile(r"^(?:[0-9a-f]{2}){32,100}$")
 # FCM registration tokens have no Google-documented fixed length or exact
 # charset, but are always base64url-ish (real-world tokens use this alphabet,
 # never APNs' plain lowercase hex) -- a strict whitelist, not "anything that

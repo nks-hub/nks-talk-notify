@@ -401,8 +401,29 @@ def test_register_device_rejects_token_matching_neither_shape(app, fake_device):
 # --- token_kind() -------------------------------------------------------------
 
 
-def test_token_kind_apns():
+def test_token_kind_apns_64_chars():
+    """The historical 32-byte token -- still valid, just no longer required."""
     assert token_kind("aa" * 32) == "apns"
+
+
+def test_token_kind_apns_160_chars():
+    """Apple doesn't guarantee 32 bytes; observed live on a real device/simulator."""
+    assert token_kind("aa" * 80) == "apns"
+
+
+def test_token_kind_apns_rejects_odd_hex_length():
+    from app.server import _APNS_TOKEN_RE
+
+    # 63 hex chars -- not a whole number of bytes, must not match APNs
+    # specifically (an all-hex string this long still matches the FCM
+    # whitelist -- that fallback is intended, this test is about APNs only)
+    assert _APNS_TOKEN_RE.match("a" * 63) is None
+
+
+def test_token_kind_apns_rejects_too_long():
+    from app.server import _APNS_TOKEN_RE
+
+    assert _APNS_TOKEN_RE.match("aa" * 101) is None  # 202 hex chars, over the 200 ceiling
 
 
 def test_token_kind_fcm():
