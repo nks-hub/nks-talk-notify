@@ -38,6 +38,11 @@ _EXPECTED_SUBJECT_B64_LEN = 344
 
 MAX_BODY_BYTES = 1024 * 1024  # S3: 1 MiB request cap
 MAX_NOTIFICATIONS_PER_REQUEST = 100  # S4: cap batch size
+# Hard, own-controlled ceiling for draining a rejected oversized body -- see
+# Handler._drain(). Independent of MAX_BODY_BYTES: this exists to let the
+# reverse proxy finish relaying a realistically-oversized body so it can
+# deliver our 413 cleanly, not to define what we accept.
+_DRAIN_CAP_BYTES = 8 * 1024 * 1024
 
 
 class RateLimiter:
@@ -290,16 +295,23 @@ def make_handler(app: App):
             body = self.rfile.read(length) if length else b""
             return parse_qs(body.decode("utf-8"), keep_blank_values=True)
 
-        def _drain(self, length: int, cap: int = 65536) -> None:
+        def _drain(self, length: int, cap: int = _DRAIN_CAP_BYTES) -> None:
             # Only ever read up to `cap` regardless of the declared
             # Content-Length: draining the full attacker-declared length
             # (possibly slow-trickled) would tie up this worker for as long
             # as they feel like sending, which is exactly the resource
-            # exhaustion S3 exists to prevent. A partial read is enough to
-            # make our 413 response land cleanly in the common case; if the
-            # client/proxy still gets a broken pipe because it hadn't
-            # finished sending, that's an acceptable outcome for a request
-            # we've already decided to reject.
+            # exhaustion S3 exists to prevent -- `cap` is a fixed constant
+            # WE control, never the client's own claim.
+            #
+            # It has to be generous, not token-sized: the Apache/ISPConfig
+            # reverse proxy in front of this service writes the whole
+            # request body to us before it will accept any response as
+            # valid. If we stop reading before it finishes writing (its
+            # buffer fills, our TCP receive window closes), it treats that
+            # as a failed upstream and returns its own 502 instead of
+            # relaying our 413 -- reproduced live with a too-small cap.
+            # `cap` still bounds the damage a hostile Content-Length can do;
+            # the rate limiter above bounds how often one source can repeat it.
             self.rfile.read(min(length, cap))
 
         def _client_ip(self) -> str:

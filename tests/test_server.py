@@ -545,34 +545,36 @@ def test_oversized_body_is_rejected(live_server):
 
 def test_oversized_body_drain_is_capped_not_unbounded(live_server):
     """S3 regression guard: draining the full attacker-declared Content-Length
-    (rather than a small capped amount) reopens the DoS the cap exists to
-    close -- a slow/never-finished upload would tie up a worker indefinitely.
+    (rather than a fixed, own-controlled cap) reopens the DoS the cap exists
+    to close -- a slow/never-finished upload would tie up a worker forever.
 
-    Declares a huge length, sends only a few KB, and *keeps the connection
-    open* (no EOF) -- an uncapped drain blocks forever waiting for the rest
-    of the declared length, since nothing more is ever sent. A capped drain
-    reads only its cap and responds immediately regardless."""
+    Declares a huge length, sends more than _DRAIN_CAP_BYTES, and *keeps the
+    connection open* (no EOF) -- an uncapped drain blocks forever waiting
+    for the rest of the declared length, since nothing more is ever sent.
+    A capped drain reads only its cap and responds regardless."""
     import socket
     from urllib.parse import urlsplit
 
+    from app.server import _DRAIN_CAP_BYTES
+
     base_url, _fake = live_server
     parts = urlsplit(base_url)
-    huge_declared_length = 50 * 1024 * 1024  # 50 MiB, never actually sent
+    huge_declared_length = _DRAIN_CAP_BYTES * 4  # never actually sent
 
-    with socket.create_connection((parts.hostname, parts.port), timeout=5) as sock:
+    with socket.create_connection((parts.hostname, parts.port), timeout=10) as sock:
         sock.sendall(
             f"POST /devices HTTP/1.1\r\n"
             f"Host: {parts.netloc}\r\n"
             f"Content-Length: {huge_declared_length}\r\n\r\n".encode()
         )
-        sock.sendall(b"a" * 70000)  # over the 64 KiB drain cap, still far short of the declared length
+        sock.sendall(b"a" * (_DRAIN_CAP_BYTES + 4096))  # over the cap, still far short of the declared length
         # deliberately no shutdown/EOF -- a well-behaved capped drain must
         # not need one to respond
-        sock.settimeout(2)
+        sock.settimeout(5)
         try:
             response = sock.recv(4096)
         except TimeoutError:
-            assert False, "no response within 2s -- drain looks unbounded (waiting for the rest of Content-Length)"
+            assert False, "no response within 5s -- drain looks unbounded (waiting for the rest of Content-Length)"
     assert response.decode().startswith("HTTP/1.1 413")
 
 
