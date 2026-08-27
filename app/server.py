@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 
-from . import apns, crypto
+from . import apns, crypto, fcm
 from .config import Config
 from .db import DeviceStore, PublicKeyMismatch
 
@@ -29,7 +29,25 @@ _NOTIFICATION_KEY_RE = re.compile(r"^notifications\[(\d+)\]$")
 
 # S2: lowercase hex only -- must match exactly how the client hashes it for
 # Nextcloud's own pushTokenHash, or the two never agree on the same device.
-_PUSH_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+_APNS_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+# FCM registration tokens have no Google-documented fixed length or exact
+# charset, but are always base64url-ish (real-world tokens use this alphabet,
+# never APNs' plain lowercase hex) -- a strict whitelist, not "anything that
+# isn't an APNs token", since this also gets sent on to Google's API.
+_FCM_TOKEN_RE = re.compile(r"^[A-Za-z0-9_:-]{32,4096}$")
+
+
+def token_kind(push_token: str) -> Optional[str]:
+    """Which provider a push token belongs to, or None if it matches neither.
+
+    Cheapest reliable signal available: token shape. The registration
+    caller never declares a provider explicitly.
+    """
+    if _APNS_TOKEN_RE.match(push_token):
+        return "apns"
+    if _FCM_TOKEN_RE.match(push_token):
+        return "fcm"
+    return None
 
 # S4: RSA-2048 ciphertext is always exactly 256 bytes -> base64 is always
 # exactly 344 chars. Anything else is malformed by definition, reject before
@@ -98,10 +116,17 @@ class ReplayGuard:
 class App:
     """Holds the long-lived dependencies a request handler needs."""
 
-    def __init__(self, config: Config, store: DeviceStore, apns_client: apns.ApnsClient):
+    def __init__(
+        self,
+        config: Config,
+        store: DeviceStore,
+        apns_client: Optional[apns.ApnsClient] = None,
+        fcm_client: Optional[fcm.FcmClient] = None,
+    ):
         self.config = config
         self.store = store
         self.apns_client = apns_client
+        self.fcm_client = fcm_client
         self.replay_guard = ReplayGuard()
         # S3: /devices is client-facing and cheap to abuse -> tight cap.
         # /notifications is the (trusted, but unauthenticated-if-S1-unset)
@@ -127,7 +152,7 @@ class App:
         if not (push_token and device_identifier and signature and public_key):
             return HTTPStatus.BAD_REQUEST, {"message": "MISSING_FIELDS"}
 
-        if not _PUSH_TOKEN_RE.match(push_token):  # S2: path-injection guard, cheap so check first
+        if token_kind(push_token) is None:  # S2: path-injection guard, cheap so check first
             return HTTPStatus.BAD_REQUEST, {"message": "INVALID_PUSH_TOKEN"}
 
         if not crypto.verify_device_identifier_signature(
@@ -221,23 +246,54 @@ class App:
             if self.replay_guard.seen_before((device_identifier, signature)):  # S5
                 continue  # already delivered once, silently drop the repeat
 
-            push_type, priority = apns.push_type_and_priority(nc_type, nc_priority)
-            payload = apns.build_payload(push_type=push_type, encrypted_subject_b64=subject)
-            result = self.apns_client.send(
-                device_token=device.push_token, payload=payload, push_type=push_type, priority=priority
-            )
+            kind = token_kind(device.push_token)
+            if kind == "apns":
+                forget = self._send_via_apns(device.push_token, subject, nc_type, nc_priority)
+            elif kind == "fcm":
+                forget = self._send_via_fcm(device.push_token, subject, nc_priority)
+            else:
+                forget = None  # defensive: registration already rejects anything else
 
-            if result.ok:
-                continue
-            if result.should_forget_device:
-                log.info("APNs reason=%s for a device, forgetting it", result.reason)
+            if forget is None:
+                failed += 1
+            elif forget:
                 self.store.delete(device_identifier)
                 unknown.append(device_identifier)
-            else:
-                log.warning("APNs push failed: status=%s reason=%s", result.status_code, result.reason)
-                failed += 1
+            # forget is False: delivered fine, nothing to do
 
         return HTTPStatus.OK, {"unknown": unknown, "failed": failed}
+
+    def _send_via_apns(self, device_token: str, subject: str, nc_type: str, nc_priority: str) -> Optional[bool]:
+        """Returns True if the device should be forgotten, False if delivered
+        fine, None on failure that doesn't warrant forgetting it (or if APNs
+        isn't configured -- own env vars unset while an APNs token is somehow
+        registered, e.g. after a config change)."""
+        if self.apns_client is None:
+            log.warning("APNs token needs sending but APNs is not configured")
+            return None
+        push_type, priority = apns.push_type_and_priority(nc_type, nc_priority)
+        payload = apns.build_payload(push_type=push_type, encrypted_subject_b64=subject)
+        result = self.apns_client.send(device_token=device_token, payload=payload, push_type=push_type, priority=priority)
+        if result.ok:
+            return False
+        if result.should_forget_device:
+            log.info("APNs reason=%s for a device, forgetting it", result.reason)
+            return True
+        log.warning("APNs push failed: status=%s reason=%s", result.status_code, result.reason)
+        return None
+
+    def _send_via_fcm(self, device_token: str, subject: str, nc_priority: str) -> Optional[bool]:
+        if self.fcm_client is None:
+            log.warning("FCM token needs sending but FCM is not configured")
+            return None
+        result = self.fcm_client.send(device_token=device_token, encrypted_subject_b64=subject, priority=nc_priority)
+        if result.ok:
+            return False
+        if result.should_forget_device:
+            log.info("FCM error_code=%s for a device, forgetting it", result.error_code)
+            return True
+        log.warning("FCM push failed: status=%s error_code=%s", result.status_code, result.error_code)
+        return None
 
 
 def _first(d: dict, key: str) -> Optional[str]:
@@ -379,7 +435,12 @@ def make_handler(app: App):
     return Handler
 
 
-def run_server(config: Config, store: DeviceStore, apns_client: apns.ApnsClient) -> ThreadingHTTPServer:
-    app = App(config, store, apns_client)
+def run_server(
+    config: Config,
+    store: DeviceStore,
+    apns_client: Optional[apns.ApnsClient] = None,
+    fcm_client: Optional[fcm.FcmClient] = None,
+) -> ThreadingHTTPServer:
+    app = App(config, store, apns_client, fcm_client)
     server = ThreadingHTTPServer((config.listen_host, config.listen_port), make_handler(app))
     return server

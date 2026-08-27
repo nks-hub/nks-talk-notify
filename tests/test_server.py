@@ -10,10 +10,10 @@ from urllib.parse import urlencode
 
 import pytest
 
-from app import apns
+from app import apns, fcm
 from app.config import Config
 from app.db import DeviceStore
-from app.server import App, run_server
+from app.server import App, run_server, token_kind
 from .conftest import make_fake_device
 
 
@@ -29,13 +29,28 @@ class FakeApnsClient:
         return self.result
 
 
+class FakeFcmClient:
+    def __init__(self, result: fcm.FcmResult):
+        self.result = result
+        self.calls: list[dict] = []
+
+    def send(self, *, device_token, encrypted_subject_b64, priority):
+        self.calls.append({"device_token": device_token, "encrypted_subject_b64": encrypted_subject_b64, "priority": priority})
+        return self.result
+
+
 OK_RESULT = apns.ApnsResult(status_code=200, apns_id="abc", reason=None)
+FCM_OK_RESULT = fcm.FcmResult(status_code=200, error_code=None)
 
 # S4: real `subject` is always base64 of a 256-byte RSA-2048 ciphertext
 # (344 chars). Tests that aren't specifically about that length must use a
 # correctly-sized stand-in or they'll be rejected before reaching the code
 # path they mean to exercise.
 FAKE_SUBJECT = bytes(range(256))
+
+# A real APNs token is 64 lowercase hex chars ("aa"*32 elsewhere in this
+# file); a plausible-shaped FCM token for tests -- long, base64url alphabet.
+FAKE_FCM_TOKEN = "fcm-token_" + "Ab3" * 20
 
 
 def _make_config(tmp_path, **overrides):
@@ -45,6 +60,8 @@ def _make_config(tmp_path, **overrides):
         apns_team_id="unused",
         apns_topic="com.nkshub.nextcloudtalk",
         apns_use_sandbox=True,
+        fcm_project_id="",
+        fcm_service_account_path="",
         db_path=str(tmp_path / "devices.db"),
         listen_host="127.0.0.1",
         listen_port=0,
@@ -58,8 +75,9 @@ def _make_config(tmp_path, **overrides):
 def app(tmp_path):
     config = _make_config(tmp_path)
     store = DeviceStore(config.db_path)
-    fake = FakeApnsClient(OK_RESULT)
-    a = App(config, store, fake)
+    fake_apns = FakeApnsClient(OK_RESULT)
+    fake_fcm = FakeFcmClient(FCM_OK_RESULT)
+    a = App(config, store, fake_apns, fake_fcm)
     yield a
     store.close()
 
@@ -360,21 +378,191 @@ def test_register_device_rejects_non_hex_push_token(app, fake_device):
     assert body["message"] == "INVALID_PUSH_TOKEN"
 
 
-def test_register_device_rejects_uppercase_push_token(app, fake_device):
-    """Must match Nextcloud's own pushTokenHash regex expectations -- lowercase only."""
+def test_register_device_uppercase_64_chars_is_valid_fcm_shape_not_rejected(app, fake_device):
+    """An uppercase 64-char token doesn't match the APNs pattern (lowercase
+    hex only, matching Nextcloud's own pushTokenHash regex requirements),
+    but IS a plausible FCM token shape -- must not be blanket-rejected just
+    for not being lowercase, or real FCM registrations would fail too."""
     form = _register_form(fake_device)
     form["pushToken"] = "AA" * 32
     status, body = app.register_device(_as_qs_dict(form))
-    assert status == HTTPStatus.BAD_REQUEST
-    assert body["message"] == "INVALID_PUSH_TOKEN"
+    assert status == HTTPStatus.OK
+    assert token_kind("AA" * 32) == "fcm"
 
 
-def test_register_device_rejects_wrong_length_push_token(app, fake_device):
+def test_register_device_rejects_token_matching_neither_shape(app, fake_device):
     form = _register_form(fake_device)
-    form["pushToken"] = "aa" * 31  # 62 hex chars, not 64
+    form["pushToken"] = "!!!"  # too short for FCM, wrong charset for either
     status, body = app.register_device(_as_qs_dict(form))
     assert status == HTTPStatus.BAD_REQUEST
     assert body["message"] == "INVALID_PUSH_TOKEN"
+
+
+# --- token_kind() -------------------------------------------------------------
+
+
+def test_token_kind_apns():
+    assert token_kind("aa" * 32) == "apns"
+
+
+def test_token_kind_fcm():
+    assert token_kind(FAKE_FCM_TOKEN) == "fcm"
+
+
+def test_token_kind_rejects_too_short_for_either():
+    assert token_kind("short") is None
+
+
+def test_token_kind_rejects_disallowed_characters():
+    # spaces and dots are outside both whitelists, even at a plausible length
+    assert token_kind("not a valid.token" + "x" * 20) is None
+
+
+# --- FCM registration + dispatch ----------------------------------------------
+
+
+def _register_fcm_form(device):
+    return {
+        "pushToken": FAKE_FCM_TOKEN,
+        "deviceIdentifier": device.device_identifier,
+        "deviceIdentifierSignature": device.signature,
+        "userPublicKey": device.public_key_pem,
+    }
+
+
+def test_register_fcm_device_success(app, fake_device):
+    status, body = app.register_device(_as_qs_dict(_register_fcm_form(fake_device)))
+    assert status == HTTPStatus.OK
+    stored = app.store.get(fake_device.device_identifier)
+    assert stored.push_token == FAKE_FCM_TOKEN
+
+
+def test_notifications_dispatches_fcm_device_to_fcm_client_not_apns(app, fake_device):
+    app.register_device(_as_qs_dict(_register_fcm_form(fake_device)))
+    subject = FAKE_SUBJECT
+    entry = {
+        "deviceIdentifier": fake_device.device_identifier,
+        "pushTokenHash": app.push_token_hash(FAKE_FCM_TOKEN),
+        "subject": base64.b64encode(subject).decode(),
+        "signature": fake_device.sign_subject(subject),
+        "priority": "high",
+        "type": "alert",
+    }
+    status, body = app.send_notifications(_notif_form([entry]))
+    assert body == {"unknown": [], "failed": 0}
+    assert app.apns_client.calls == []
+    assert len(app.fcm_client.calls) == 1
+    call = app.fcm_client.calls[0]
+    assert call["device_token"] == FAKE_FCM_TOKEN
+    assert call["encrypted_subject_b64"] == base64.b64encode(subject).decode()
+    assert call["priority"] == "high"
+
+
+def test_notifications_fcm_unregistered_forgets_device_and_reports_unknown(app, fake_device):
+    """S6-for-FCM: UNREGISTERED is the destructive one -- delete + unknown."""
+    app.register_device(_as_qs_dict(_register_fcm_form(fake_device)))
+    app.fcm_client.result = fcm.FcmResult(status_code=404, error_code="UNREGISTERED")
+    subject = FAKE_SUBJECT
+    entry = {
+        "deviceIdentifier": fake_device.device_identifier,
+        "pushTokenHash": app.push_token_hash(FAKE_FCM_TOKEN),
+        "subject": base64.b64encode(subject).decode(),
+        "signature": fake_device.sign_subject(subject),
+        "priority": "normal",
+        "type": "alert",
+    }
+    status, body = app.send_notifications(_notif_form([entry]))
+    assert body == {"unknown": [fake_device.device_identifier], "failed": 0}
+    assert app.store.get(fake_device.device_identifier) is None
+
+
+def test_notifications_fcm_invalid_argument_is_failed_not_unknown(app, fake_device):
+    """S6-for-FCM: INVALID_ARGUMENT must NOT be treated like UNREGISTERED --
+    `unknown` is destructive, only a genuinely dead token belongs there."""
+    app.register_device(_as_qs_dict(_register_fcm_form(fake_device)))
+    app.fcm_client.result = fcm.FcmResult(status_code=400, error_code="INVALID_ARGUMENT")
+    subject = FAKE_SUBJECT
+    entry = {
+        "deviceIdentifier": fake_device.device_identifier,
+        "pushTokenHash": app.push_token_hash(FAKE_FCM_TOKEN),
+        "subject": base64.b64encode(subject).decode(),
+        "signature": fake_device.sign_subject(subject),
+        "priority": "normal",
+        "type": "alert",
+    }
+    status, body = app.send_notifications(_notif_form([entry]))
+    assert body == {"unknown": [], "failed": 1}
+    assert app.store.get(fake_device.device_identifier) is not None
+
+
+def test_notifications_apns_device_still_dispatches_to_apns_client(app, fake_device):
+    """Regression guard: adding FCM must not break the existing APNs path."""
+    app.register_device(_as_qs_dict(_register_form(fake_device)))  # APNs-shaped token
+    subject = FAKE_SUBJECT
+    entry = {
+        "deviceIdentifier": fake_device.device_identifier,
+        "pushTokenHash": app.push_token_hash("aa" * 32),
+        "subject": base64.b64encode(subject).decode(),
+        "signature": fake_device.sign_subject(subject),
+        "priority": "high",
+        "type": "alert",
+    }
+    status, body = app.send_notifications(_notif_form([entry]))
+    assert body == {"unknown": [], "failed": 0}
+    assert app.fcm_client.calls == []
+    assert len(app.apns_client.calls) == 1
+
+
+def test_notifications_fcm_token_without_fcm_client_configured_counts_as_failed(tmp_path, fake_device):
+    """A branch being unconfigured must degrade to `failed`, never crash."""
+    config = _make_config(tmp_path)
+    store = DeviceStore(config.db_path)
+    a = App(config, store, FakeApnsClient(OK_RESULT), fcm_client=None)
+    try:
+        a.register_device(_as_qs_dict(_register_fcm_form(fake_device)))
+        subject = FAKE_SUBJECT
+        entry = {
+            "deviceIdentifier": fake_device.device_identifier,
+            "pushTokenHash": a.push_token_hash(FAKE_FCM_TOKEN),
+            "subject": base64.b64encode(subject).decode(),
+            "signature": fake_device.sign_subject(subject),
+            "priority": "normal",
+            "type": "alert",
+        }
+        status, body = a.send_notifications(_notif_form([entry]))
+        assert body == {"unknown": [], "failed": 1}
+        assert a.store.get(fake_device.device_identifier) is not None  # not forgotten, just undeliverable right now
+    finally:
+        store.close()
+
+
+# --- Config: independently optional branches ----------------------------------
+
+
+def test_config_requires_at_least_one_provider(tmp_path):
+    from app.config import ConfigError
+
+    with pytest.raises(ConfigError):
+        _make_config(tmp_path, apns_key_path="", apns_key_id="", apns_team_id="", fcm_project_id="", fcm_service_account_path="")
+
+
+def test_config_apns_only_is_valid(tmp_path):
+    config = _make_config(tmp_path)
+    assert config.apns_enabled
+    assert not config.fcm_enabled
+
+
+def test_config_fcm_only_is_valid(tmp_path):
+    config = _make_config(
+        tmp_path,
+        apns_key_path="",
+        apns_key_id="",
+        apns_team_id="",
+        fcm_project_id="proj",
+        fcm_service_account_path="/tmp/sa.json",
+    )
+    assert config.fcm_enabled
+    assert not config.apns_enabled
 
 
 # --- real HTTP wire test (form-urlencoded, matching Nextcloud's client) -----

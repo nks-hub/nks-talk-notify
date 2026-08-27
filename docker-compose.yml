@@ -7,9 +7,14 @@ services:
     env_file: .env
     environment:
       APNS_KEY_PATH: /secrets/apns-key.p8
+      FCM_SERVICE_ACCOUNT_PATH: /secrets/fcm-service-account.json
     volumes:
       - ./data:/data
-      - ${APNS_KEY_HOST_PATH}:/secrets/apns-key.p8:ro
+      # APNs and FCM are each optional (see .env.example); /dev/null as a
+      # fallback source keeps the mount valid when a provider's *_HOST_PATH
+      # is unset, so the container still starts with just the other one.
+      - ${APNS_KEY_HOST_PATH:-/dev/null}:/secrets/apns-key.p8:ro
+      - ${FCM_SERVICE_ACCOUNT_HOST_PATH:-/dev/null}:/secrets/fcm-service-account.json:ro
     ports:
       # S8: bind to a specific host address, never 0.0.0.0 -- see BIND_ADDR
       # in .env.example.

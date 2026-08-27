@@ -1,8 +1,10 @@
 # nks-talk-notify
 
-A minimal, self-hosted push proxy that lets iOS push notifications reach a
+A minimal, self-hosted push proxy that lets push notifications reach a
 **closed** NKS Talk app (`com.nkshub.nextcloudtalk`), the third-party
-Nextcloud Talk client this project builds.
+Nextcloud Talk client this project builds — iOS via APNs, Android via FCM.
+Either provider can be configured independently; a deployment with only one
+of the two runs fine.
 
 ## Why this exists
 
@@ -23,6 +25,21 @@ delivery such as `notify_push` only works while the app is running in the
 foreground). This service is that proxy: it holds the app's own APNs key and
 nothing else — it never decrypts a notification's content, it only routes
 already-encrypted, already-signed messages to Apple.
+
+Android's equivalent problem: the app used to route through
+`org.unifiedpush.android:embedded-fcm-distributor`, a public UnifiedPush
+gateway that re-delivers Web Push requests as FCM messages through Google
+Play Services. Content stayed encrypted, but the app depended on
+infrastructure this project doesn't control for basic delivery. Android is
+Talk's **native** push path now, on the same push-v2 contract as iOS, over
+this same proxy — UnifiedPush Web Push remains available as a switchable
+fallback in the app if this path ever has problems, but is not the default.
+Nextcloud is no more aware of Android's provider than it is of iOS's: same
+`Push.php` code path, same `proxyserver` grouping, no platform branching on
+the server at all — this proxy is the only thing that knows a given
+registered device is an iPhone or an Android phone, and it only knows
+because of the *shape* of the token the device handed it (see
+`token_kind()` below), not because anyone tells it.
 
 ## The wire contract (verified against Nextcloud source)
 
@@ -58,7 +75,7 @@ Form-urlencoded body:
 
 | field | meaning |
 | --- | --- |
-| `pushToken` | the real APNs device token (hex string) |
+| `pushToken` | the real device token — APNs (hex string) or FCM registration token, see below |
 | `deviceIdentifier` | `base64(sha512(preimage))`, exactly as Nextcloud returned it |
 | `deviceIdentifierSignature` | `base64(signature)`, exactly as Nextcloud returned it |
 | `userPublicKey` | `publicKey`, exactly as Nextcloud returned it |
@@ -68,16 +85,25 @@ the client sends to *Nextcloud* must equal `sha512(pushToken)` computed the
 same way this proxy computes it — SHA-512 of the UTF-8 hex token string
 (`app/server.py::App.push_token_hash`). If the mobile client hashes
 differently (e.g. over raw token bytes instead of the hex string), delivery
-lookups in `POST /notifications` will never match. Confirm this with
-whoever implements the iOS registration flow.
+lookups in `POST /notifications` will never match. Confirmed with the iOS
+and Android registration flows.
 
 See `app/crypto.py` for exactly how the signature is verified and why it
 cannot be verified as a normal signature (the digest, not the preimage, is
 all the proxy ever has).
 
+**Which provider a token belongs to is never declared by the caller** —
+this proxy infers it from the token's shape (`app/server.py::token_kind()`):
+an APNs device token is exactly 64 lowercase hex characters; anything else
+matching a strict base64url-ish whitelist (`[A-Za-z0-9_:-]`, 32–4096 chars)
+is treated as FCM. A token matching neither is rejected outright — this is
+also what closed off `apns.py`'s `f"/3/device/{device_token}"` as a
+path-injection vector (S2), so the FCM branch gets the same strict
+whitelist treatment rather than "anything that isn't APNs".
+
 Responses: `200` empty body on success (matches what current official
-clients expect), `400` on a missing field or a signature that doesn't
-verify, `409` if `deviceIdentifier` is already registered under a
+clients expect), `400` on a missing/invalid field or a signature that
+doesn't verify, `403` if `deviceIdentifier` is already registered under a
 *different* `userPublicKey` (see Security below).
 
 ### 3. `DELETE /devices`
@@ -120,10 +146,39 @@ else defaults to `normal`/`alert`, deletions are always `normal`/`background`.
 
 This proxy verifies `signature` against the **stored** `userPublicKey` for
 that `deviceIdentifier` (plain RSA-SHA512 over the decoded ciphertext, see
-`crypto.verify_subject_signature`) before ever calling APNs — this is the
-only thing standing between "any HTTP client on the internet" and pushing
-arbitrary payloads to a real device, since this endpoint itself has no
-other authentication.
+`crypto.verify_subject_signature`) before ever calling APNs or FCM — this
+is the only thing standing between "any HTTP client on the internet" and
+pushing arbitrary payloads to a real device, since this endpoint itself has
+no other authentication beyond S1's optional subscription key.
+
+**Which provider actually gets called** is decided per-entry from the
+stored device's token shape (`token_kind()`, same function as
+registration) — `app/server.py::App._send_via_apns()` /
+`_send_via_fcm()`:
+
+- **APNs** (`app/apns.py`): as described elsewhere in this document —
+  `mutable-content: 1` + generic alert, encrypted `subject` in `nc-subject`.
+- **FCM** (`app/fcm.py`, HTTP v1): `POST
+  https://fcm.googleapis.com/v1/projects/<project-id>/messages:send`,
+  authenticated with an OAuth2 access token minted from a Google service
+  account JSON (RS256 JWT bearer grant, cached the same way the APNs JWT
+  is). The message is **`data`-only** — no `notification` block, or Android
+  renders a plaintext OS banner itself and the app never gets a chance to
+  decrypt anything, the same reasoning as APNs' `mutable-content`:
+  ```json
+  {"message": {"token": "<fcm token>", "data": {"nc-subject": "..."}, "android": {"priority": "high"}}}
+  ```
+  `priority` maps directly (Nextcloud's `high`/`normal` are already FCM's
+  `android.priority` values, no translation table needed). FCM v1's error
+  responses carry a `google.rpc.Status` body with an `errorCode` in
+  `error.details[]`; only `UNREGISTERED` (the token is permanently gone,
+  APNs' `410`/`BadDeviceToken` equivalent) triggers delete + `unknown`.
+  Anything else, including `INVALID_ARGUMENT`, is `failed` — a malformed
+  *request* doesn't mean the *token* is dead, and `unknown` is destructive
+  (see below), so don't conflate the two (`app/fcm.py::FcmResult.should_forget_device`).
+- If the provider a stored token needs isn't configured (e.g. an FCM token
+  is registered but `FCM_PROJECT_ID`/`FCM_SERVICE_ACCOUNT_PATH` are unset),
+  that entry counts as `failed` — never a crash, never silently dropped.
 
 **Response Nextcloud expects**, and enforces via
 `Push::sendNotificationsToProxies()` reading `unknown`/`failed` from the
@@ -300,19 +355,30 @@ See `.env.example` for the full annotated list. Summary:
 
 | Variable | Required | Meaning |
 | --- | --- | --- |
-| `APNS_KEY_PATH` | yes | path to the `.p8` APNs auth key inside the container |
-| `APNS_KEY_ID` | yes | the key's Key ID (Apple Developer portal) |
-| `APNS_TEAM_ID` | yes | Apple Developer Team ID |
+| `APNS_KEY_PATH` | one of APNs/FCM | path to the `.p8` APNs auth key inside the container |
+| `APNS_KEY_ID` | one of APNs/FCM | the key's Key ID (Apple Developer portal) |
+| `APNS_TEAM_ID` | one of APNs/FCM | Apple Developer Team ID |
 | `APNS_TOPIC` | no (default `com.nkshub.nextcloudtalk`) | app bundle id / APNs topic |
 | `APNS_USE_SANDBOX` | no (default `0`) | `1` to talk to `api.sandbox.push.apple.com` (debug/TestFlight builds) |
+| `FCM_PROJECT_ID` | one of APNs/FCM | Google Cloud/Firebase project ID this proxy sends through |
+| `FCM_SERVICE_ACCOUNT_PATH` | one of APNs/FCM | path to the service account JSON inside the container |
 | `DB_PATH` | no (default `/data/devices.db`) | SQLite file |
 | `LISTEN_HOST` / `LISTEN_PORT` | no (default `0.0.0.0` / `8080`) | bind address (container-internal) |
 | `NEXTCLOUD_SUBSCRIPTION_KEY` | no (unset = `/notifications` unauthenticated, logs a startup warning) | matches Nextcloud's `X-Nextcloud-Subscription-Key`, see Security model |
 | `APNS_KEY_HOST_PATH` | docker-compose only | absolute host path to the real `.p8` file |
+| `FCM_SERVICE_ACCOUNT_HOST_PATH` | docker-compose only | absolute host path to the real service account JSON |
 | `BIND_ADDR` | docker-compose only (default `127.0.0.1`) | host address the container port is published on — see Security model |
 
-The `.p8` private key itself is **never** an environment variable and never
-committed — it is bind-mounted read-only into the container.
+**At least one of APNs (all three `APNS_*` required fields) or FCM (both
+`FCM_*` required fields) must be configured, or the service refuses to
+start** — `app/config.py::Config.__post_init__`. Either can be left
+entirely unset to run with just the other provider; the missing one logs a
+startup warning and any notification needing it counts as `failed` rather
+than crashing anything (`app/__main__.py`).
+
+Neither the `.p8` private key nor the FCM service account JSON is ever an
+environment variable and never committed — both are bind-mounted read-only
+into the container.
 
 ## Running locally
 
@@ -464,7 +530,9 @@ app.
 
 ## What's intentionally not here
 
-- No FCM/Android path — this proxy is APNs/iOS only.
+- No sender-side platform detection field — providers are told apart purely
+  by token shape (see above); there's no `platform` parameter to add or get
+  out of sync with reality.
 - No multi-tenant support beyond what the wire contract already gives for
   free (any Nextcloud server can point `proxyServer` at this instance;
   there is nothing NKS-specific baked into the protocol handling).
