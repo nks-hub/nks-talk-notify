@@ -491,15 +491,19 @@ app.
 ### Rotating the FCM service account
 
 1. Firebase Console → Project Settings → Service Accounts → Generate new
-   private key, for the same project (`FCM_PROJECT_ID`).
+   private key, for the same project (`FCM_PROJECT_ID`). The old key keeps
+   working until you revoke it.
 2. Copy the new JSON to the host, e.g.
-   `/opt/nks-talk-notify/secrets/fcm-service-account-<date>.json`.
+   `/opt/nks-talk-notify/secrets/fcm-service-account-<date>.json` — next to
+   the `.p8`, same `chown` to the container user + `chmod 400`.
 3. Update `.env`: `FCM_SERVICE_ACCOUNT_HOST_PATH`.
 4. `docker compose up -d` (recreates the container with the new mount).
-5. Verify: `docker compose logs --tail 20` shows a clean start with no
-   `FCM is not configured` warning, then trigger a real notification and
-   confirm it arrives (or watch for a real OAuth2 exchange in the log —
-   see Live verification below).
+5. Verify from the logs that the OAuth2 exchange succeeds: a line for
+   `POST https://oauth2.googleapis.com/token` returning `200`. A `401` or
+   `invalid_grant` there means the key, the `client_email`, or the clock is
+   wrong — it is not a token problem yet, don't go looking at device tokens
+   first. Once that's clean, trigger a real notification and confirm it
+   arrives.
 6. Once confirmed, delete/disable the old service account key in the
    Firebase Console and remove the old JSON from the host.
 
@@ -516,32 +520,26 @@ Flip it in `.env`, `docker compose up -d`. If every APNs device starts
 getting deleted right after registering (`BadDeviceToken` in the log), this
 mismatch is the first thing to check — see Troubleshooting.
 
-### Rotating the FCM service account
-
-1. Firebase console → Project settings → Service accounts → Generate new
-   private key. The old key keeps working until you revoke it.
-2. Copy the JSON to the host next to the `.p8`, `chown` it to the container
-   user and `chmod 400`.
-3. Update `FCM_SERVICE_ACCOUNT_HOST_PATH` in `.env`, then
-   `docker compose up -d`.
-4. Verify from the logs that the OAuth2 exchange succeeds: a line for
-   `POST https://oauth2.googleapis.com/token` returning `200`. A `401` or
-   `invalid_grant` there means the key, the client email or the clock is
-   wrong — it is not a token problem.
-5. Delete the old key in the Google Cloud console once the new one is
-   confirmed, and remove the old JSON from the host.
-
 ### Reading the logs
 
-Two things mislead everyone at least once:
+`docker compose logs` — timestamps are **UTC**, not local time; a line that
+looks two hours old is usually two minutes old, compare against `date -u`,
+not your own clock.
 
-- **The container logs in UTC**, while the hosts around it run local time.
-  A line that looks two hours old is usually two minutes old. Compare
-  against `date -u`, not against your own clock.
-- **Every request shows the reverse proxy's address**, not the caller's,
-  because the access log prints the peer address. The rate limiter reads
-  `X-Forwarded-For` and does see the real client, but the access log does
-  not — do not conclude from it that traffic came from inside the network.
+**Every request logs the reverse proxy's address, not the caller's** — the
+access log prints the raw socket peer, and behind the reverse proxy that's
+the proxy's own LAN IP (`192.0.2.10` in the reference deployment). The
+rate limiter reads `X-Forwarded-For` and does see the real client for its
+own decisions, but the access log line itself does not — don't conclude
+from it that traffic came from inside the network. A real client IP, if
+you need one, is in the reverse proxy's own access log, not here.
+
+An FCM send logs two lines worth telling apart: `POST
+https://oauth2.googleapis.com/token` is the JWT→access-token exchange
+(fails here = bad service account, wrong key, or Google-side auth
+problem); `POST https://fcm.googleapis.com/v1/projects/.../messages:send`
+is the actual push (fails here with a `4xx` = auth was fine, the *message*
+was rejected — see the FCM error-code table under Security model).
 
 ### Live verification against the running proxy
 
@@ -595,25 +593,6 @@ head -c 1100000 /dev/zero | tr '\0' 'a' > /tmp/big.txt
 curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<host>/devices --data-binary @/tmp/big.txt
 # → 413
 ```
-
-### Reading the logs
-
-`docker compose logs` — timestamps are **UTC**, not local time; line up
-incidents against that, not wall clock. Every line logs the caller's
-address first: behind the reverse proxy that's normally the **proxy's own
-LAN IP** (`192.0.2.10` in the reference deployment), not the real
-internet client — `_client_ip()` uses `X-Forwarded-For` for rate-limiting
-decisions, but the stdlib access-log line itself always prints the raw
-socket peer. A real client IP, if you need one, is in the reverse proxy's
-own access log, not here.
-
-An FCM send logs two extra lines worth knowing apart: `POST
-https://oauth2.googleapis.com/token` is the JWT→access-token exchange
-(fails here = bad service account, wrong key, or Google-side auth
-problem); `POST https://fcm.googleapis.com/v1/projects/.../messages:send`
-is the actual push (fails here with a `4xx` = auth was fine, the
-*message* was rejected — see the FCM error-code table under Security
-model).
 
 ### Troubleshooting: notifications aren't arriving
 
