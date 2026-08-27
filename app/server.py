@@ -333,6 +333,15 @@ def make_handler(app: App):
         # made Apache substitute its own generic error page for our 413
         # instead of relaying it -- not worth it for no functional gain.
         protocol_version = "HTTP/1.1"
+        # stdlib StreamRequestHandler applies this to the underlying socket
+        # (settimeout in setup(), handled via handle_timeout()/socket.timeout
+        # everywhere the connection blocks -- reading the request line AND
+        # reading a body). Without it, a client that opens a connection and
+        # never finishes sending holds a thread forever; ThreadingHTTPServer
+        # has no cap on concurrent threads, so that's an unbounded resource
+        # hold from a single slow/malicious client. 10s is generous for a
+        # real mobile network, short enough that abuse self-heals fast.
+        timeout = 10
 
         def log_message(self, fmt: str, *args) -> None:  # quiet default stderr access log
             log.info("%s - %s", self.address_string(), fmt % args)
@@ -362,8 +371,42 @@ def make_handler(app: App):
             # hanging after every response.
             self.close_connection = True
 
-        def _read_form(self) -> dict:
-            length = int(self.headers.get("Content-Length", "0") or "0")
+        def _content_length(self) -> Optional[int]:
+            """Validated Content-Length, or None if missing/malformed/negative.
+
+            `int()` alone accepts "-1" happily, and `self.rfile.read(-1)`
+            then means "read until EOF" instead of "no body" -- a client
+            sending a negative Content-Length turns S3's own size check
+            (`length > MAX_BODY_BYTES`, false for -1) into an unbounded read
+            that holds the thread until the peer closes on its own, i.e.
+            never. Centralized so every caller that reads a request body
+            goes through the same validation, not just the one a report
+            happened to name.
+            """
+            raw = self.headers.get("Content-Length")
+            if raw is None:
+                return 0
+            try:
+                length = int(raw)
+            except ValueError:
+                return None
+            return length if length >= 0 else None
+
+        def _validate_length(self) -> tuple[bool, int]:
+            """Checks Content-Length and, if it's oversized, rejects with 413
+            (draining what the proxy is trying to send, see _drain). Returns
+            (False, 0) with the error response already sent, or (True, length)."""
+            length = self._content_length()
+            if length is None:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"message": "INVALID_CONTENT_LENGTH"})
+                return False, 0
+            if length > MAX_BODY_BYTES:  # S3
+                self._drain(length)
+                self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"message": "BODY_TOO_LARGE"})
+                return False, 0
+            return True, length
+
+        def _read_form(self, length: int) -> dict:
             body = self.rfile.read(length) if length else b""
             return parse_qs(body.decode("utf-8"), keep_blank_values=True)
 
@@ -411,28 +454,31 @@ def make_handler(app: App):
         def do_POST(self) -> None:  # noqa: N802
             path = urlsplit(self.path).path
 
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            if length > MAX_BODY_BYTES:  # S3 -- normally caught earlier by handle_expect_100, this
-                self._drain(length)  # covers requests that skip Expect: 100-continue entirely
-                self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"message": "BODY_TOO_LARGE"})
+            ok, length = self._validate_length()  # S3, and rejects a bad/negative Content-Length outright
+            if not ok:
                 return
 
             if path == "/devices":
                 if not app.devices_rate_limiter.allow(self._client_ip()):  # S3
                     self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"message": "RATE_LIMITED"})
                     return
-                status, body = app.register_device(self._read_form())
+                status, body = app.register_device(self._read_form(length))
             elif path == "/notifications":
+                # S1, fail closed: an unset key must REJECT every request,
+                # not accept them. The old "only check if key is set" logic
+                # made a missing/misconfigured key equivalent to no auth at
+                # all -- a misconfiguration silently becoming an open relay.
+                # /devices doesn't get this: it's never the caller that would
+                # send this header (Nextcloud is), so it stays gated purely
+                # by the deviceIdentifier signature + key pin as designed.
                 key = app.config.nextcloud_subscription_key
-                if key and not hmac.compare_digest(
-                    self.headers.get("X-Nextcloud-Subscription-Key", ""), key
-                ):  # S1
+                if not key or not hmac.compare_digest(self.headers.get("X-Nextcloud-Subscription-Key", ""), key):
                     self._send_json(HTTPStatus.UNAUTHORIZED, {"message": "UNAUTHORIZED"})
                     return
                 if not app.notifications_rate_limiter.allow(self._client_ip()):  # S3
                     self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"message": "RATE_LIMITED"})
                     return
-                status, body = app.send_notifications(self._read_form())
+                status, body = app.send_notifications(self._read_form(length))
             else:
                 status, body = HTTPStatus.NOT_FOUND, {"message": "NOT_FOUND"}
             self._send_json(status, body)
@@ -442,9 +488,17 @@ def make_handler(app: App):
             if split.path != "/devices":
                 self._send_json(HTTPStatus.NOT_FOUND, {"message": "NOT_FOUND"})
                 return
+
+            ok, length = self._validate_length()  # same guard POST gets -- this read a body unchecked before
+            if not ok:
+                return
+            if not app.devices_rate_limiter.allow(self._client_ip()):  # same bucket as POST /devices, same resource
+                self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"message": "RATE_LIMITED"})
+                return
+
             params = parse_qs(split.query, keep_blank_values=True)
             if not params:
-                params = self._read_form()
+                params = self._read_form(length)
             status, body = app.unregister_device(params)
             self._send_json(status, body)
 

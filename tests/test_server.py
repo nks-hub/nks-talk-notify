@@ -625,32 +625,43 @@ def test_health_endpoint_supports_head(live_server):
         assert resp.read() == b""  # HEAD must not carry a body
 
 
-def test_register_and_notify_over_http_form_urlencoded(live_server, fake_device):
-    base_url, fake = live_server
-    form = _register_form(fake_device)
-    req = urllib.request.Request(
-        f"{base_url}/devices", data=urlencode(form).encode(), method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        assert resp.status == 200
+def test_register_and_notify_over_http_form_urlencoded(tmp_path, fake_device):
+    # S1 is fail-closed: /notifications needs a configured key even here,
+    # where the point of the test is the wire format, not the auth gate --
+    # so a custom server (not the shared keyless `live_server` fixture).
+    base_url, fake, server, store = _start_live_server(tmp_path, nextcloud_subscription_key="s3cr3t")
+    try:
+        form = _register_form(fake_device)
+        req = urllib.request.Request(
+            f"{base_url}/devices", data=urlencode(form).encode(), method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
 
-    subject = FAKE_SUBJECT
-    entry = {
-        "deviceIdentifier": fake_device.device_identifier,
-        "pushTokenHash": hash_for_wire_test(form["pushToken"]),
-        "subject": base64.b64encode(subject).decode(),
-        "signature": fake_device.sign_subject(subject),
-        "priority": "high",
-        "type": "alert",
-    }
-    notif_body = urlencode({"notifications[0]": json.dumps(entry)}).encode()
-    req = urllib.request.Request(f"{base_url}/notifications", data=notif_body, method="POST")
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        assert resp.status == 200
-        body = json.loads(resp.read())
-    assert body == {"unknown": [], "failed": 0}
-    assert len(fake.calls) == 1
+        subject = FAKE_SUBJECT
+        entry = {
+            "deviceIdentifier": fake_device.device_identifier,
+            "pushTokenHash": hash_for_wire_test(form["pushToken"]),
+            "subject": base64.b64encode(subject).decode(),
+            "signature": fake_device.sign_subject(subject),
+            "priority": "high",
+            "type": "alert",
+        }
+        notif_body = urlencode({"notifications[0]": json.dumps(entry)}).encode()
+        req = urllib.request.Request(
+            f"{base_url}/notifications", data=notif_body, method="POST",
+            headers={"X-Nextcloud-Subscription-Key": "s3cr3t"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+            body = json.loads(resp.read())
+        assert body == {"unknown": [], "failed": 0}
+        assert len(fake.calls) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        store.close()
 
 
 def hash_for_wire_test(push_token: str) -> str:
@@ -753,6 +764,23 @@ def test_devices_endpoint_is_not_gated_by_subscription_key(tmp_path, fake_device
         store.close()
 
 
+def test_notifications_rejects_everything_when_key_is_unset(live_server):
+    """S1 fail-closed: NEXTCLOUD_SUBSCRIPTION_KEY unset must mean /notifications
+    rejects every caller, not that auth is simply skipped -- a misconfigured
+    (missing) key must never be equivalent to "no auth needed"."""
+    base_url, _fake = live_server  # default fixture: no key configured
+    req = urllib.request.Request(
+        f"{base_url}/notifications",
+        data=urlencode({"notifications[0]": '{"deviceIdentifier":"x","pushTokenHash":"x","subject":"x","signature":"x"}'}).encode(),
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        assert False, "expected 401"
+    except urllib.error.HTTPError as e:
+        assert e.code == 401
+
+
 # --- S3: body size cap -------------------------------------------------------
 
 
@@ -767,6 +795,36 @@ def test_oversized_body_is_rejected(live_server):
         assert False, "expected 413"
     except urllib.error.HTTPError as e:
         assert e.code == 413
+
+
+def test_negative_content_length_is_rejected_not_read_forever(live_server):
+    """A negative Content-Length makes `int()` happy but turns
+    `self.rfile.read(length)` into "read until EOF" (Python's read(-1)
+    semantics) -- an unauthenticated client can hold a worker thread open
+    indefinitely with one request and never send a byte of body. Must be
+    rejected outright, fast, before any attempt to read a body."""
+    import socket
+    import time
+    from urllib.parse import urlsplit
+
+    base_url, _fake = live_server
+    parts = urlsplit(base_url)
+
+    started = time.monotonic()
+    with socket.create_connection((parts.hostname, parts.port), timeout=5) as sock:
+        sock.sendall(
+            f"POST /devices HTTP/1.1\r\n"
+            f"Host: {parts.netloc}\r\n"
+            f"Content-Length: -1\r\n\r\n".encode()
+        )
+        # deliberately send no body -- a fixed server must not wait for one
+        sock.settimeout(5)
+        response = b""
+        while b"\r\n\r\n" not in response:
+            response += sock.recv(4096)
+    elapsed = time.monotonic() - started
+    assert response.decode().startswith("HTTP/1.1 400")
+    assert elapsed < 2, f"took {elapsed}s -- looks like it tried to read(-1) until EOF"
 
 
 def test_oversized_body_drain_is_capped_not_unbounded(live_server):
