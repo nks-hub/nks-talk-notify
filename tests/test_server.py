@@ -2,18 +2,14 @@ from __future__ import annotations
 
 import base64
 import json
-import threading
-import urllib.error
-import urllib.request
 from http import HTTPStatus
-from urllib.parse import urlencode
 
 import pytest
 
 from app import apns, fcm
 from app.config import Config
 from app.db import DeviceStore
-from app.server import App, run_server, token_kind
+from app.server import App, token_kind
 from .conftest import make_fake_device
 
 
@@ -101,6 +97,8 @@ def app(tmp_path):
 def _register_form(device):
     return {
         "pushToken": "aa" * 32,
+        "pushProvider": "apns",
+        "pushEnvironment": "development",
         "deviceIdentifier": device.device_identifier,
         "deviceIdentifierSignature": device.signature,
         "userPublicKey": device.public_key_pem,
@@ -122,6 +120,7 @@ def test_register_device_success(app, fake_device):
     assert stored is not None
     assert stored.push_token == "aa" * 32
     assert stored.push_token_hash == app.push_token_hash("aa" * 32)
+    assert stored.push_provider == "apns"
 
 
 @pytest.mark.parametrize("environment", ["development", "production"])
@@ -144,6 +143,26 @@ def test_register_apns_device_rejects_unknown_environment(app, fake_device):
 
     assert status == HTTPStatus.BAD_REQUEST
     assert body == {"message": "INVALID_PUSH_ENVIRONMENT"}
+
+
+def test_register_apns_device_requires_environment(app, fake_device):
+    form = _register_form(fake_device)
+    del form["pushEnvironment"]
+
+    status, body = app.register_device(_as_qs_dict(form))
+
+    assert status == HTTPStatus.BAD_REQUEST
+    assert body == {"message": "INVALID_PUSH_ENVIRONMENT"}
+
+
+def test_register_device_rejects_unknown_provider(app, fake_device):
+    form = _register_form(fake_device)
+    form["pushProvider"] = "webpush"
+
+    status, body = app.register_device(_as_qs_dict(form))
+
+    assert status == HTTPStatus.BAD_REQUEST
+    assert body == {"message": "INVALID_PUSH_PROVIDER"}
 
 
 def test_register_device_missing_field(app, fake_device):
@@ -398,6 +417,26 @@ def test_notifications_deletion_breaker_caps_mass_deletion(app):
     assert len(surviving) == 1, "exactly one device should have been protected by the breaker"
 
 
+def test_notifications_deletion_breaker_caps_lookup_misses(app):
+    entries = [
+        {
+            "deviceIdentifier": f"missing-{i}",
+            "pushTokenHash": "ignored",
+            "subject": "ignored",
+            "signature": "ignored",
+        }
+        for i in range(11)
+    ]
+
+    status, body = app.send_notifications(_notif_form(entries))
+
+    assert status == HTTPStatus.OK
+    assert body == {
+        "unknown": [f"missing-{i}" for i in range(10)],
+        "failed": 1,
+    }
+
+
 def test_notifications_transient_apns_error_keeps_device_and_counts_failed(app, fake_device):
     app.register_device(_as_qs_dict(_register_form(fake_device)))
     app.apns_client.result = apns.ApnsResult(status_code=429, apns_id=None, reason="TooManyRequests")
@@ -428,8 +467,8 @@ def test_notifications_batch_over_cap_counts_extras_as_failed(app):
     entries = [{"deviceIdentifier": f"nope-{i}", "pushTokenHash": "x", "subject": "x", "signature": "x"} for i in range(MAX_NOTIFICATIONS_PER_REQUEST + 5)]
     status, body = app.send_notifications(_notif_form(entries))
     assert status == HTTPStatus.OK
-    assert body["failed"] == 5
-    assert len(body["unknown"]) == MAX_NOTIFICATIONS_PER_REQUEST  # only the processed ones looked up
+    assert body["failed"] == 5 + MAX_NOTIFICATIONS_PER_REQUEST - 10
+    assert len(body["unknown"]) == 10
 
 
 # --- push token format (S2) --------------------------------------------------
@@ -450,6 +489,8 @@ def test_register_device_uppercase_64_chars_is_valid_fcm_shape_not_rejected(app,
     for not being lowercase, or real FCM registrations would fail too."""
     form = _register_form(fake_device)
     form["pushToken"] = "AA" * 32
+    form["pushProvider"] = "fcm"
+    form.pop("pushEnvironment")
     status, body = app.register_device(_as_qs_dict(form))
     assert status == HTTPStatus.OK
     assert token_kind("AA" * 32) == "fcm"
@@ -510,6 +551,7 @@ def test_token_kind_rejects_disallowed_characters():
 def _register_fcm_form(device):
     return {
         "pushToken": FAKE_FCM_TOKEN,
+        "pushProvider": "fcm",
         "deviceIdentifier": device.device_identifier,
         "deviceIdentifierSignature": device.signature,
         "userPublicKey": device.public_key_pem,
@@ -521,6 +563,39 @@ def test_register_fcm_device_success(app, fake_device):
     assert status == HTTPStatus.OK
     stored = app.store.get(fake_device.device_identifier)
     assert stored.push_token == FAKE_FCM_TOKEN
+    assert stored.push_provider == "fcm"
+
+
+def test_register_fcm_device_rejects_environment(app, fake_device):
+    form = _register_fcm_form(fake_device)
+    form["pushEnvironment"] = "production"
+
+    status, body = app.register_device(_as_qs_dict(form))
+
+    assert status == HTTPStatus.BAD_REQUEST
+    assert body == {"message": "INVALID_PUSH_ENVIRONMENT"}
+
+
+def test_explicit_fcm_provider_overrides_ambiguous_hex_token(app, fake_device):
+    form = _register_fcm_form(fake_device)
+    form["pushToken"] = "aa" * 32
+    app.register_device(_as_qs_dict(form))
+    subject = FAKE_SUBJECT
+    entry = {
+        "deviceIdentifier": fake_device.device_identifier,
+        "pushTokenHash": app.push_token_hash(form["pushToken"]),
+        "subject": base64.b64encode(subject).decode(),
+        "signature": fake_device.sign_subject(subject),
+        "priority": "high",
+        "type": "alert",
+    }
+
+    status, body = app.send_notifications(_notif_form([entry]))
+
+    assert status == HTTPStatus.OK
+    assert body == {"unknown": [], "failed": 0}
+    assert app.apns_client.calls == []
+    assert len(app.fcm_client.calls) == 1
 
 
 def test_notifications_dispatches_fcm_device_to_fcm_client_not_apns(app, fake_device):
@@ -600,6 +675,41 @@ def test_notifications_apns_device_still_dispatches_to_apns_client(app, fake_dev
     assert app.fcm_client.calls == []
     assert len(app.apns_client.calls) == 1
     assert app.apns_client.calls[0]["environment"] == "production"
+
+
+def test_notifications_routes_apns_development_production_and_legacy_together(app):
+    devices = [
+        make_fake_device(f'["apns-environment-{i}","1"]'.encode())
+        for i in range(3)
+    ]
+    environments = ["development", "production", None]
+    entries = []
+    for index, (device, environment) in enumerate(zip(devices, environments)):
+        token = f"{index + 1:02x}" * 32
+        form = _register_form(device)
+        form["pushToken"] = token
+        if environment is None:
+            form.pop("pushProvider")
+            form.pop("pushEnvironment")
+        else:
+            form["pushEnvironment"] = environment
+        app.register_device(_as_qs_dict(form))
+        entries.append(
+            {
+                "deviceIdentifier": device.device_identifier,
+                "pushTokenHash": app.push_token_hash(token),
+                "subject": base64.b64encode(FAKE_SUBJECT).decode(),
+                "signature": device.sign_subject(FAKE_SUBJECT),
+                "priority": "normal",
+                "type": "alert",
+            }
+        )
+
+    status, body = app.send_notifications(_notif_form(entries))
+
+    assert status == HTTPStatus.OK
+    assert body == {"unknown": [], "failed": 0}
+    assert [call["environment"] for call in app.apns_client.calls] == environments
 
 
 def test_notifications_fcm_token_without_fcm_client_configured_counts_as_failed(tmp_path, fake_device):

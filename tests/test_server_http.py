@@ -104,7 +104,7 @@ def hash_for_wire_test(push_token: str) -> str:
     return hashlib.sha512(push_token.encode("utf-8")).hexdigest()
 
 
-def test_delete_device_over_http_query_params(live_server, fake_device):
+def test_delete_device_rejects_query_params(live_server, fake_device):
     base_url, _fake = live_server
     form = _register_form(fake_device)
     req = urllib.request.Request(
@@ -115,19 +115,44 @@ def test_delete_device_over_http_query_params(live_server, fake_device):
 
     qs = urlencode({"deviceIdentifier": fake_device.device_identifier, "deviceIdentifierSignature": fake_device.signature})
     req = urllib.request.Request(f"{base_url}/devices?{qs}", method="DELETE")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == HTTPStatus.BAD_REQUEST
+
+
+def test_delete_device_accepts_identity_only_in_body(live_server, fake_device):
+    base_url, _fake = live_server
+    form = _register_form(fake_device)
+    req = urllib.request.Request(
+        f"{base_url}/devices", data=urlencode(form).encode(), method="POST"
+    )
+    urllib.request.urlopen(req, timeout=5).close()
+
+    body = urlencode(
+        {
+            "deviceIdentifier": fake_device.device_identifier,
+            "deviceIdentifierSignature": fake_device.signature,
+        }
+    ).encode()
+    req = urllib.request.Request(f"{base_url}/devices", data=body, method="DELETE")
     with urllib.request.urlopen(req, timeout=5) as resp:
-        assert resp.status == 200  # S7
+        assert resp.status == HTTPStatus.OK
+    assert store_is_empty(base_url)
+
+
+def store_is_empty(base_url: str) -> bool:
+    with urllib.request.urlopen(f"{base_url}/health", timeout=5) as resp:
+        return json.loads(resp.read())["devices"] == 0
 
 
 def test_access_log_never_contains_the_query_string(live_server, fake_device, caplog):
-    """A device's deviceIdentifier + deviceIdentifierSignature travel in the
-    DELETE /devices query string -- logging the raw request line puts a
-    device's credentials in plaintext in every log that line reaches."""
+    """A rejected query must not expose device identity in this access log."""
     base_url, _fake = live_server
     qs = urlencode({"deviceIdentifier": fake_device.device_identifier, "deviceIdentifierSignature": fake_device.signature})
     req = urllib.request.Request(f"{base_url}/devices?{qs}", method="DELETE")
     with caplog.at_level("INFO", logger="nks-talk-notify"):
-        urllib.request.urlopen(req, timeout=5).close()
+        with pytest.raises(urllib.error.HTTPError):
+            urllib.request.urlopen(req, timeout=5)
 
     for record in caplog.records:
         message = record.getMessage()

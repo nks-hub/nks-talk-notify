@@ -18,6 +18,7 @@ def test_register_new_device(store):
     )
     assert device.device_identifier == "id-1"
     assert device.push_environment is None
+    assert device.push_provider is None
     assert store.count() == 1
 
 
@@ -28,11 +29,13 @@ def test_register_same_identifier_updates_push_token(store):
         user_public_key="pubkey-1",
         push_token="new-token",
         push_token_hash="new-hash",
+        push_provider="apns",
         push_environment="production",
     )
     assert updated.push_token == "new-token"
     assert updated.push_token_hash == "new-hash"
     assert updated.push_environment == "production"
+    assert updated.push_provider == "apns"
     assert store.count() == 1  # still one row, not a duplicate
 
 
@@ -101,7 +104,7 @@ def test_concurrent_first_registrations_under_different_keys_never_corrupt(store
     assert stored.push_token == f"token-{winner}"  # never another thread's token
 
 
-def test_existing_database_is_migrated_with_push_environment(tmp_path):
+def test_existing_database_is_migrated_without_changing_legacy_row(tmp_path):
     import sqlite3
 
     path = tmp_path / "old-devices.db"
@@ -116,19 +119,25 @@ def test_existing_database_is_migrated_with_push_environment(tmp_path):
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        INSERT INTO devices VALUES (
+            'legacy-id', 'legacy-key', 'legacy-token', 'legacy-hash',
+            '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z'
+        );
         """
     )
+    connection.commit()
     connection.close()
 
     migrated = DeviceStore(str(path))
     try:
-        device = migrated.register(
-            device_identifier="id-1",
-            user_public_key="pubkey-1",
-            push_token="token-1",
-            push_token_hash="hash-1",
-            push_environment="development",
-        )
-        assert device.push_environment == "development"
+        device = migrated.get("legacy-id")
+        assert device.device_identifier == "legacy-id"
+        assert device.user_public_key == "legacy-key"
+        assert device.push_token == "legacy-token"
+        assert device.push_token_hash == "legacy-hash"
+        assert device.push_provider is None
+        assert device.push_environment is None
+        assert device.created_at == "2026-01-01T00:00:00Z"
+        assert device.updated_at == "2026-01-02T00:00:00Z"
     finally:
         migrated.close()

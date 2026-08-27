@@ -76,6 +76,8 @@ Form-urlencoded body:
 | field | meaning |
 | --- | --- |
 | `pushToken` | the real device token — APNs (hex string) or FCM registration token, see below |
+| `pushProvider` | `apns` or `fcm`; current clients always send this explicitly |
+| `pushEnvironment` | required for APNs: `development` or `production`; forbidden for FCM |
 | `deviceIdentifier` | `base64(sha512(preimage))`, exactly as Nextcloud returned it |
 | `deviceIdentifierSignature` | `base64(signature)`, exactly as Nextcloud returned it |
 | `userPublicKey` | `publicKey`, exactly as Nextcloud returned it |
@@ -92,14 +94,13 @@ See `app/crypto.py` for exactly how the signature is verified and why it
 cannot be verified as a normal signature (the digest, not the preimage, is
 all the proxy ever has).
 
-**Which provider a token belongs to is never declared by the caller** —
-this proxy infers it from the token's shape (`app/server.py::token_kind()`):
-an APNs device token is exactly 64 lowercase hex characters; anything else
-matching a strict base64url-ish whitelist (`[A-Za-z0-9_:-]`, 32–4096 chars)
-is treated as FCM. A token matching neither is rejected outright — this is
-also what closed off `apns.py`'s `f"/3/device/{device_token}"` as a
-path-injection vector (S2), so the FCM branch gets the same strict
-whitelist treatment rather than "anything that isn't APNs".
+Current clients declare `pushProvider=apns|fcm`. This matters because the
+documented FCM alphabet includes lowercase hex strings too, so token shape is
+not an identity. APNs tokens must be 64-200 lowercase hex characters and carry
+`pushEnvironment=development|production`; FCM tokens use the strict
+`[A-Za-z0-9_:-]` whitelist at 32-4096 characters and must not carry an APNs
+environment. Rows created before `pushProvider` existed keep a null provider;
+only those legacy rows use `token_kind()` shape inference during delivery.
 
 Responses: `200` empty body on success (matches what current official
 clients expect), `400` on a missing/invalid field or a signature that
@@ -108,21 +109,14 @@ doesn't verify, `403` if `deviceIdentifier` is already registered under a
 
 ### 3. `DELETE /devices`
 
-Query params (form body also accepted): `deviceIdentifier`,
+Form-urlencoded body only: `deviceIdentifier`,
 `deviceIdentifierSignature`. The signature is checked against the **stored**
 public key, not one the caller supplies — otherwise anyone could delete any
 registration just by presenting a signature over a key of their own choice.
 `200` if nothing was registered (idempotent) or on deletion (push-v2 spec —
-not `202`), `400` if the signature doesn't verify.
-
-**Query params are deprecated — prefer the form body.** A device's
-`deviceIdentifier` + `deviceIdentifierSignature` are its credentials; in the
-query string they end up in every access log between the client and this
-proxy (this proxy's own logs never show them — see Reading the logs — but
-the reverse proxy in front of it, and anything upstream of that, is outside
-this repo's control). Query support stays only so an already-deployed
-client isn't broken by a proxy-side change; don't add a second caller that
-relies on it.
+not `202`), `400` if the signature doesn't verify or either identity field is
+put in the query string. Keeping identity out of the request line prevents it
+from reaching reverse-proxy and HTTP access logs.
 
 ### 4. Nextcloud sends notifications — `POST /notifications`
 
@@ -160,9 +154,8 @@ is the only thing standing between "any HTTP client on the internet" and
 pushing arbitrary payloads to a real device, since this endpoint itself has
 no other authentication beyond S1's optional subscription key.
 
-**Which provider actually gets called** is decided per-entry from the
-stored device's token shape (`token_kind()`, same function as
-registration) — `app/server.py::App._send_via_apns()` /
+**Which provider actually gets called** is the stored `push_provider` —
+`app/server.py::App._send_via_apns()` /
 `_send_via_fcm()`:
 
 - **APNs** (`app/apns.py`): as described elsewhere in this document —
@@ -199,8 +192,9 @@ copy of that registration:
 {"unknown": ["<deviceIdentifier>", "..."], "failed": 0}
 ```
 
-- a `deviceIdentifier` this proxy has never seen → added to `unknown`,
-  does **not** count as `failed`;
+- a `deviceIdentifier` this proxy has never seen → added to `unknown` while
+  the fleet-wide destructive-deletion budget allows it; after that budget is
+  exhausted it counts as `failed` instead;
 - a malformed entry, a `pushTokenHash` that doesn't match what we stored, a
   wrong-length or malformed `subject`, or a `signature` that fails
   verification → counts as `failed`, `unknown` untouched;
@@ -292,12 +286,12 @@ container volume plus a manual `DELETE FROM devices WHERE created_at <
 ...` sweep, not new code — revisit if `GET /health`'s device count ever
 grows in a way that isn't explained by real registrations.
 
-**Notification delivery (`POST /notifications`).** By default, no shared
-secret. The `signature` check against the pinned `userPublicKey` is the
-entire authentication for this endpoint: only someone holding the
+**Notification delivery (`POST /notifications`).** The subscription key and
+the `signature` check against the pinned `userPublicKey` authenticate this
+endpoint: only someone holding the
 Nextcloud server's identity-proof private key for that user (i.e., the real
 Nextcloud server) can produce a signature that verifies. On top of that,
-this proxy supports the **native** mechanism Nextcloud already has for
+The subscription key uses the **native** mechanism Nextcloud already has for
 exactly this: `Push::sendNotificationsToProxies()` sends an
 `X-Nextcloud-Subscription-Key` header whenever `proxyServer` matches the
 server's `subscription_aware_server` app config value. Set
@@ -432,7 +426,7 @@ mounted `:ro`.
 | `GET`/`HEAD` | `/health` | none | none | liveness + device count |
 | `POST` | `/devices` | RSA signature over `deviceIdentifier` | 20 burst, 20/min per IP | register/refresh a device |
 | `DELETE` | `/devices` | RSA signature, verified against the stored key | none | unregister a device |
-| `POST` | `/notifications` | RSA signature per entry + optional `X-Nextcloud-Subscription-Key` | 120 burst, 120/min per IP | Nextcloud → APNs relay |
+| `POST` | `/notifications` | RSA signature per entry + required `X-Nextcloud-Subscription-Key` | 120 burst, 120/min per IP | Nextcloud → APNs/FCM relay |
 
 ## Environment variables
 
@@ -449,7 +443,7 @@ See `.env.example` for the full annotated list. Summary:
 | `FCM_SERVICE_ACCOUNT_PATH` | one of APNs/FCM | path to the service account JSON inside the container |
 | `DB_PATH` | no (default `/data/devices.db`) | SQLite file |
 | `LISTEN_HOST` / `LISTEN_PORT` | no (default `0.0.0.0` / `8080`) | bind address (container-internal) |
-| `NEXTCLOUD_SUBSCRIPTION_KEY` | no (unset = `/notifications` unauthenticated, logs a startup warning) | matches Nextcloud's `X-Nextcloud-Subscription-Key`, see Security model |
+| `NEXTCLOUD_SUBSCRIPTION_KEY` | no (unset disables `/notifications` with `401` and logs a startup warning) | matches Nextcloud's `X-Nextcloud-Subscription-Key`, see Security model |
 | `APNS_KEY_HOST_PATH` | docker-compose only | absolute host path to the real `.p8` file |
 | `FCM_SERVICE_ACCOUNT_HOST_PATH` | docker-compose only | absolute host path to the real service account JSON |
 | `BIND_ADDR` | docker-compose only (default `127.0.0.1`) | host address the container port is published on — see Security model |
@@ -597,8 +591,10 @@ key.
 
 ### APNs development and production environments
 
-Current clients register `pushEnvironment=development|production` with each
-APNs device. The proxy keeps clients for both Apple endpoints open and routes
+Current clients register `pushProvider=apns` and
+`pushEnvironment=development|production` with each APNs device. Android
+registers `pushProvider=fcm` without an environment. The proxy keeps clients
+for both Apple endpoints open and routes
 each notification according to that stored value. Debug builds use
 development; Profile, Release, TestFlight, and App Store builds use
 production. Both kinds can therefore coexist in one deployment.
@@ -734,7 +730,8 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<host>/devices --data-b
    `BadTopic` (check `APNS_TOPIC` matches the
    app's actual bundle id), `TopicDisallowed` / `InvalidProviderToken` (Key
    ID or Team ID in `.env` is wrong, or the key was revoked).
-6. Confirm the stored `push_environment` matches the build: `development` for
+6. Confirm the stored `push_provider` is `apns` and `push_environment` matches
+   the build: `development` for
    debug and `production` for Profile, Release, TestFlight, or App Store. A
    null value is a legacy registration and uses `APNS_USE_SANDBOX` as fallback.
 7. If nothing shows up in this proxy's logs at all: the client likely never
@@ -744,9 +741,9 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<host>/devices --data-b
 
 ## What's intentionally not here
 
-- No sender-side platform detection field — providers are told apart purely
-  by token shape (see above); there's no `platform` parameter to add or get
-  out of sync with reality.
+- No provider inference for current clients. `pushProvider` is authoritative;
+  token-shape inference remains only for database rows created before that
+  field existed.
 - No multi-tenant support beyond what the wire contract already gives for
   free (any Nextcloud server can point `proxyServer` at this instance;
   there is nothing NKS-specific baked into the protocol handling).

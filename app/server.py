@@ -43,11 +43,7 @@ _FCM_TOKEN_RE = re.compile(r"^[A-Za-z0-9_:-]{32,4096}$")
 
 
 def token_kind(push_token: str) -> Optional[str]:
-    """Which provider a push token belongs to, or None if it matches neither.
-
-    Cheapest reliable signal available: token shape. The registration
-    caller never declares a provider explicitly.
-    """
+    """Infer a provider for registrations predating pushProvider."""
     if _APNS_TOKEN_RE.match(push_token):
         return "apns"
     if _FCM_TOKEN_RE.match(push_token):
@@ -192,17 +188,29 @@ class App:
         device_identifier = _first(form, "deviceIdentifier")
         signature = _first(form, "deviceIdentifierSignature")
         public_key = _first(form, "userPublicKey")
+        push_provider = _first(form, "pushProvider")
         push_environment = _first(form, "pushEnvironment")
         if not (push_token and device_identifier and signature and public_key):
             return HTTPStatus.BAD_REQUEST, {"message": "MISSING_FIELDS"}
 
-        kind = token_kind(push_token)
-        if kind is None:  # S2: path-injection guard, cheap so check first
+        if push_provider not in (None, "apns", "fcm"):
+            return HTTPStatus.BAD_REQUEST, {"message": "INVALID_PUSH_PROVIDER"}
+
+        kind = push_provider or token_kind(push_token)
+        valid_token = (
+            _APNS_TOKEN_RE.match(push_token)
+            if kind == "apns"
+            else _FCM_TOKEN_RE.match(push_token) if kind == "fcm" else None
+        )
+        if valid_token is None:  # S2: path-injection guard, cheap so check first
             return HTTPStatus.BAD_REQUEST, {"message": "INVALID_PUSH_TOKEN"}
-        if kind == "apns" and push_environment not in (
-            None,
+        valid_apns_environments = (
             apns.DEVELOPMENT_ENVIRONMENT,
             apns.PRODUCTION_ENVIRONMENT,
+        )
+        if kind == "apns" and (
+            push_environment not in valid_apns_environments
+            and not (push_provider is None and push_environment is None)
         ):
             return HTTPStatus.BAD_REQUEST, {"message": "INVALID_PUSH_ENVIRONMENT"}
         if kind == "fcm" and push_environment is not None:
@@ -219,6 +227,7 @@ class App:
                 user_public_key=public_key,
                 push_token=push_token,
                 push_token_hash=self.push_token_hash(push_token),
+                push_provider=push_provider,
                 push_environment=push_environment,
             )
         except PublicKeyMismatch:
@@ -277,7 +286,13 @@ class App:
             # a "failed" instead.
             device = self.store.get(device_identifier)
             if device is None:
-                unknown.append(device_identifier)
+                if self.deletion_breaker.allow("fleet"):
+                    unknown.append(device_identifier)
+                else:
+                    log.error(
+                        "deletion breaker tripped -- refusing another destructive lookup-miss response"
+                    )
+                    failed += 1
                 continue
 
             if device.push_token_hash != push_token_hash:
@@ -300,7 +315,7 @@ class App:
             if self.replay_guard.seen_before((device_identifier, signature)):  # S5
                 continue  # already delivered once, silently drop the repeat
 
-            kind = token_kind(device.push_token)
+            kind = device.push_provider or token_kind(device.push_token)
             if kind == "apns":
                 forget = self._send_via_apns(
                     device.push_token,
@@ -576,6 +591,13 @@ def make_handler(app: App):
                 self._send_json(HTTPStatus.NOT_FOUND, {"message": "NOT_FOUND"})
                 return
 
+            if split.query:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"message": "DEVICE_IDENTITY_MUST_BE_IN_BODY"},
+                )
+                return
+
             ok, length = self._validate_length()  # same guard POST gets -- this read a body unchecked before
             if not ok:
                 return
@@ -583,9 +605,7 @@ def make_handler(app: App):
                 self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"message": "RATE_LIMITED"})
                 return
 
-            params = parse_qs(split.query, keep_blank_values=True)
-            if not params:
-                params = self._read_form(length)
+            params = self._read_form(length)
             status, body = app.unregister_device(params)
             self._send_json(status, body)
 

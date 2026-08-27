@@ -23,9 +23,8 @@ def main() -> int:
 
     if not config.nextcloud_subscription_key:
         log.warning(
-            "NEXTCLOUD_SUBSCRIPTION_KEY is not set -- POST /notifications accepts requests from "
-            "anyone who can reach this proxy. Set it once your Nextcloud server has "
-            "subscription_aware_server pointed at this proxy (see README)."
+            "NEXTCLOUD_SUBSCRIPTION_KEY is not set -- POST /notifications is disabled and returns "
+            "401 until the matching Nextcloud subscription key is configured (see README)."
         )
     if not config.apns_enabled:
         log.warning("APNs is not configured -- registering/sending to APNs tokens will fail")
