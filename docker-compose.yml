@@ -1,0 +1,14 @@
+services:
+  nks-talk-notify:
+    build: .
+    image: nks-talk-notify:latest
+    container_name: nks-talk-notify
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APNS_KEY_PATH: /secrets/apns-key.p8
+    volumes:
+      - ./data:/data
+      - ${APNS_KEY_HOST_PATH}:/secrets/apns-key.p8:ro
+    ports:
+      - "${LISTEN_PORT:-8080}:8080"

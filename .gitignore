@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# secrets: the APNs key must never be committed
+*.p8
+.env
+
+# runtime state
+data/
+*.db
+*.db-wal
+*.db-shm
