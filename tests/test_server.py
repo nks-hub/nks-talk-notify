@@ -674,6 +674,23 @@ def test_delete_device_over_http_query_params(live_server, fake_device):
         assert resp.status == 200  # S7
 
 
+def test_access_log_never_contains_the_query_string(live_server, fake_device, caplog):
+    """A device's deviceIdentifier + deviceIdentifierSignature travel in the
+    DELETE /devices query string -- logging the raw request line puts a
+    device's credentials in plaintext in every log that line reaches."""
+    base_url, _fake = live_server
+    qs = urlencode({"deviceIdentifier": fake_device.device_identifier, "deviceIdentifierSignature": fake_device.signature})
+    req = urllib.request.Request(f"{base_url}/devices?{qs}", method="DELETE")
+    with caplog.at_level("INFO", logger="nks-talk-notify"):
+        urllib.request.urlopen(req, timeout=5).close()
+
+    for record in caplog.records:
+        message = record.getMessage()
+        assert fake_device.device_identifier not in message
+        assert fake_device.signature not in message
+        assert "?" not in message  # no query string at all in an access-log line
+
+
 def test_unknown_route_is_404(live_server):
     base_url, _fake = live_server
     try:

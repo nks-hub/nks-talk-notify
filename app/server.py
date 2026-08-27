@@ -337,6 +337,17 @@ def make_handler(app: App):
         def log_message(self, fmt: str, *args) -> None:  # quiet default stderr access log
             log.info("%s - %s", self.address_string(), fmt % args)
 
+        def log_request(self, code="-", size="-") -> None:
+            # Overridden (not just log_message) because stdlib's default
+            # builds the line from self.requestline, the raw request line AS
+            # SENT BY THE CLIENT -- for DELETE /devices?deviceIdentifier=...
+            # &deviceIdentifierSignature=..., that's a device's registration
+            # credentials sitting in plaintext in every log this line
+            # reaches (container stdout, the reverse proxy's access log,
+            # their rotated copies). Log path only, never the query string.
+            path = urlsplit(self.path).path
+            self.log_message('"%s %s %s" %s %s', self.command, path, self.request_version, str(code), str(size))
+
         def _send_json(self, status: int, body: dict, write_body: bool = True) -> None:
             payload = json.dumps(body).encode("utf-8") if body else b""
             self.send_response(status)

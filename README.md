@@ -115,6 +115,15 @@ registration just by presenting a signature over a key of their own choice.
 `200` if nothing was registered (idempotent) or on deletion (push-v2 spec —
 not `202`), `400` if the signature doesn't verify.
 
+**Query params are deprecated — prefer the form body.** A device's
+`deviceIdentifier` + `deviceIdentifierSignature` are its credentials; in the
+query string they end up in every access log between the client and this
+proxy (this proxy's own logs never show them — see Reading the logs — but
+the reverse proxy in front of it, and anything upstream of that, is outside
+this repo's control). Query support stays only so an already-deployed
+client isn't broken by a proxy-side change; don't add a second caller that
+relies on it.
+
 ### 4. Nextcloud sends notifications — `POST /notifications`
 
 `Push::sendNotificationsToProxies()` (line 686) posts
