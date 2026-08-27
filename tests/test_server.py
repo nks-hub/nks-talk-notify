@@ -66,6 +66,7 @@ def _make_config(tmp_path, **overrides):
         listen_host="127.0.0.1",
         listen_port=0,
         nextcloud_subscription_key="",
+        trusted_proxy_ip="",
     )
     defaults.update(overrides)
     return Config(**defaults)
@@ -925,3 +926,75 @@ def test_devices_rate_limit_returns_429(tmp_path, fake_device):
         server.shutdown()
         server.server_close()
         store.close()
+
+
+def test_client_ip_ignores_spoofed_xff_from_untrusted_peer(tmp_path, fake_device):
+    """S5: X-Forwarded-For must only be trusted from the configured reverse
+    proxy peer -- otherwise any caller can pick a fresh IP per request via
+    the header and dodge rate limiting entirely."""
+    base_url, fake, server, store = _start_live_server(tmp_path)  # trusted_proxy_ip unset -> never trust XFF
+    try:
+        form = _register_form(fake_device)
+        data = urlencode(form).encode()
+        statuses = []
+        for i in range(25):  # capacity is 20
+            req = urllib.request.Request(
+                f"{base_url}/devices", data=data, method="POST",
+                headers={"X-Forwarded-For": f"10.0.0.{i}"},  # a different "IP" every request
+            )
+            try:
+                resp = urllib.request.urlopen(req, timeout=5)
+                statuses.append(resp.status)
+            except urllib.error.HTTPError as e:
+                statuses.append(e.code)
+        assert 429 in statuses, "spoofed X-Forwarded-For let every request look like a fresh IP"
+    finally:
+        server.shutdown()
+        server.server_close()
+        store.close()
+
+
+def test_client_ip_uses_last_xff_entry_from_trusted_peer(tmp_path, fake_device):
+    """S5: mod_proxy_http appends the real peer to any X-Forwarded-For the
+    client already sent, it doesn't replace it -- the first entry can be
+    attacker-supplied even through the real proxy. Must use the last one."""
+    base_url, fake, server, store = _start_live_server(tmp_path, trusted_proxy_ip="127.0.0.1")
+    try:
+        form = _register_form(fake_device)
+        data = urlencode(form).encode()
+        statuses = []
+        for i in range(25):  # capacity is 20
+            # first entry (attacker-controlled) changes every request; last
+            # entry (what a trusted proxy itself would have appended) stays fixed
+            req = urllib.request.Request(
+                f"{base_url}/devices", data=data, method="POST",
+                headers={"X-Forwarded-For": f"10.0.0.{i}, 203.0.113.9"},
+            )
+            try:
+                resp = urllib.request.urlopen(req, timeout=5)
+                statuses.append(resp.status)
+            except urllib.error.HTTPError as e:
+                statuses.append(e.code)
+        assert 429 in statuses, "varying the first XFF entry dodged the rate limit -- last entry isn't being used"
+    finally:
+        server.shutdown()
+        server.server_close()
+        store.close()
+
+
+def test_rate_limiter_evicts_idle_full_buckets(monkeypatch):
+    """S5: an attacker cycling through distinct keys (or, before the XFF fix,
+    distinct spoofed IPs) must not grow this dict forever."""
+    from app.server import RateLimiter, _BUCKET_IDLE_SECONDS
+
+    fake_now = [1000.0]
+    monkeypatch.setattr("app.server.time.monotonic", lambda: fake_now[0])
+
+    limiter = RateLimiter(capacity=5, refill_per_sec=1)
+    limiter.allow("visitor-1")
+    assert "visitor-1" in limiter._buckets
+
+    fake_now[0] += _BUCKET_IDLE_SECONDS + 3600  # idle long enough to refill fully AND go stale
+
+    limiter.allow("visitor-2")  # any call prunes stale buckets first
+    assert "visitor-1" not in limiter._buckets, "idle, fully-refilled bucket should have been evicted"

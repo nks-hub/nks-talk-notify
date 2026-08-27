@@ -68,6 +68,9 @@ MAX_NOTIFICATIONS_PER_REQUEST = 100  # S4: cap batch size
 _DRAIN_CAP_BYTES = 8 * 1024 * 1024
 
 
+_BUCKET_IDLE_SECONDS = 3600.0  # S5: forget a fully-refilled bucket after this long unused
+
+
 class RateLimiter:
     """Per-key token bucket. S3: cheap DoS guard, not a precision limiter."""
 
@@ -76,12 +79,29 @@ class RateLimiter:
         self._refill_per_sec = refill_per_sec
         self._buckets: dict[str, tuple[float, float]] = {}
         self._lock = threading.Lock()
-        # ponytail: buckets are never evicted; fine for the IP cardinality a
-        # single proxy sees, revisit only if that stops being true.
 
     def allow(self, key: str) -> bool:
         now = time.monotonic()
         with self._lock:
+            # S5: without this, a caller cycling through distinct keys grows
+            # this dict forever -- previously reachable by spoofing
+            # X-Forwarded-For (now closed, see _client_ip), kept as a bound
+            # here too since nothing should trust that fix alone.
+            # ponytail: O(n) prune on every call, same tradeoff ReplayGuard
+            # already makes -- fine at this proxy's scale. A bucket only
+            # goes stale once it's idle long enough to have refilled to full
+            # capacity (computed here, not read from the stored -- possibly
+            # not-yet-refilled -- token count), so evicting one is exactly
+            # equivalent to it never having existed.
+            stale_cutoff = now - _BUCKET_IDLE_SECONDS
+            stale_keys = [
+                k
+                for k, (tokens, last) in self._buckets.items()
+                if last < stale_cutoff and min(self._capacity, tokens + (now - last) * self._refill_per_sec) >= self._capacity
+            ]
+            for stale_key in stale_keys:
+                del self._buckets[stale_key]
+
             tokens, last = self._buckets.get(key, (float(self._capacity), now))
             tokens = min(self._capacity, tokens + (now - last) * self._refill_per_sec)
             if tokens < 1:
@@ -430,12 +450,22 @@ def make_handler(app: App):
             self.rfile.read(min(length, cap))
 
         def _client_ip(self) -> str:
-            # Deployed behind the ISPConfig/Apache reverse proxy on gateway-host,
-            # which sets X-Forwarded-For; fall back to the raw peer for
-            # direct/local access (tests, health checks).
-            forwarded = self.headers.get("X-Forwarded-For")
-            if forwarded:
-                return forwarded.split(",")[0].strip()
+            # Only trust X-Forwarded-For when it's the known reverse proxy
+            # (TRUSTED_PROXY_IP, e.g. 192.0.2.10 on the reference
+            # deployment) on the wire directly -- anyone else can put
+            # whatever they like in that header, and if we believed it
+            # unconditionally, a single attacker could pick a fresh IP for
+            # every request and dodge the rate limiters entirely. Take the
+            # *last* entry, not the first: mod_proxy_http appends the real
+            # peer to whatever X-Forwarded-For the client already sent
+            # rather than replacing it, so the first entry can be
+            # attacker-supplied even when the request did come through our
+            # own proxy.
+            trusted_proxy = app.config.trusted_proxy_ip
+            if trusted_proxy and self.client_address[0] == trusted_proxy:
+                forwarded = self.headers.get("X-Forwarded-For")
+                if forwarded:
+                    return forwarded.split(",")[-1].strip()
             return self.client_address[0]
 
         def _route_get(self) -> tuple[int, dict]:

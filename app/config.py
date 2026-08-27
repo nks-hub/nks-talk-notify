@@ -27,6 +27,7 @@ class Config:
     listen_host: str
     listen_port: int
     nextcloud_subscription_key: str
+    trusted_proxy_ip: str
 
     @property
     def apns_enabled(self) -> bool:
@@ -58,6 +59,13 @@ class Config:
             # S1: matches Nextcloud's own Push::sendNotificationsToProxies
             # X-Nextcloud-Subscription-Key header, sent only when this proxy's
             # URL is registered as the server's `subscription_aware_server`.
-            # Empty = unauthenticated /notifications (warn at startup, don't block).
+            # Empty = /notifications rejects everyone (fail closed, warn at startup).
             nextcloud_subscription_key=os.environ.get("NEXTCLOUD_SUBSCRIPTION_KEY", "").strip(),
+            # S3/S5: the one peer address allowed to set X-Forwarded-For for
+            # rate-limiting purposes -- the reverse proxy in front of this
+            # service. Empty = never trust X-Forwarded-For, always rate-limit
+            # by the raw TCP peer (safe default; anyone able to spoof the
+            # header could otherwise pick a fresh IP per request and dodge
+            # every limit).
+            trusted_proxy_ip=os.environ.get("TRUSTED_PROXY_IP", "").strip(),
         )
