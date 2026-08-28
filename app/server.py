@@ -26,6 +26,7 @@ import httpx
 from . import apns, crypto, fcm
 from .config import Config
 from .db import DeviceStore, PublicKeyMismatch
+from .provider_errors import ProviderResponseError
 
 log = logging.getLogger("nks-talk-notify")
 
@@ -405,7 +406,7 @@ class App:
                     forget = self._send_via_fcm(device.push_token, subject, nc_priority)
                 else:
                     forget = None  # defensive: registration already rejects anything else
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, ProviderResponseError) as exc:
                 log.warning(
                     "push provider request failed: provider=%s error=%s",
                     kind,

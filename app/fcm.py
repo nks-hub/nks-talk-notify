@@ -19,6 +19,8 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+from .provider_errors import ProviderResponseError
+
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
 _SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
 _TOKEN_LIFETIME_S = 50 * 60  # Google access tokens last 1h; refresh with margin
@@ -91,7 +93,11 @@ class FcmAuthTokenFactory:
             },
         )
         response.raise_for_status()
-        return response.json()["access_token"]
+        payload = _json_object(response, "FCM OAuth")
+        access_token = payload.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise ProviderResponseError("FCM OAuth response omitted access_token")
+        return access_token
 
 
 @dataclass(frozen=True)
@@ -139,10 +145,27 @@ class FcmClient:
 def _error_code(response: httpx.Response) -> Optional[str]:
     if response.status_code == 200:
         return None
-    try:
-        for detail in response.json().get("error", {}).get("details", []):
-            if "errorCode" in detail:
-                return detail["errorCode"]
-    except (json.JSONDecodeError, ValueError, AttributeError):
-        pass
+    payload = _json_object(response, "FCM send")
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        raise ProviderResponseError("FCM send response omitted error object")
+    details = error.get("details", [])
+    if not isinstance(details, list):
+        raise ProviderResponseError("FCM send response has invalid error details")
+    for detail in details:
+        if not isinstance(detail, dict):
+            raise ProviderResponseError("FCM send response has invalid error detail")
+        error_code = detail.get("errorCode")
+        if isinstance(error_code, str):
+            return error_code
     return None
+
+
+def _json_object(response: httpx.Response, provider: str) -> dict:
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ProviderResponseError(f"{provider} response was not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ProviderResponseError(f"{provider} response was not a JSON object")
+    return payload

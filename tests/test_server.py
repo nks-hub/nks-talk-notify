@@ -11,6 +11,7 @@ from app import apns, fcm
 from app.config import Config
 from app.db import DeviceStore
 from app.server import App, ReplayGuard, ReplayLease, token_kind
+from app.provider_errors import ProviderResponseError
 from .conftest import make_fake_device
 
 
@@ -565,6 +566,58 @@ def test_notifications_apns_transport_error_counts_failed_and_can_be_retried(
     assert len(retry_client.calls) == 1
 
 
+@pytest.mark.parametrize("provider", ["apns", "fcm"])
+def test_notifications_provider_protocol_error_does_not_abort_batch(
+    app,
+    provider,
+):
+    devices = [
+        make_fake_device(f'["protocol-{provider}-{i}","1"]'.encode())
+        for i in range(2)
+    ]
+    push_token = "aa" * 32 if provider == "apns" else "fcm-token-" + "a" * 32
+    for device in devices:
+        form = _register_form(device)
+        form["pushToken"] = push_token
+        form["pushProvider"] = provider
+        if provider == "fcm":
+            form.pop("pushEnvironment")
+        assert app.register_device(_as_qs_dict(form))[0] == HTTPStatus.OK
+
+    class FirstCallFails:
+        def __init__(self):
+            self.calls = 0
+
+        def send(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise ProviderResponseError("malformed provider response")
+            return OK_RESULT if provider == "apns" else FCM_OK_RESULT
+
+    client = FirstCallFails()
+    if provider == "apns":
+        app.apns_client = client
+    else:
+        app.fcm_client = client
+    entries = [
+        {
+            "deviceIdentifier": device.device_identifier,
+            "pushTokenHash": app.push_token_hash(push_token),
+            "subject": base64.b64encode(FAKE_SUBJECT).decode(),
+            "signature": device.sign_subject(FAKE_SUBJECT),
+            "priority": "normal",
+            "type": "alert",
+        }
+        for device in devices
+    ]
+
+    status, body = app.send_notifications(_notif_form(entries))
+
+    assert status == HTTPStatus.OK
+    assert body == {"unknown": [], "failed": 1}
+    assert client.calls == 2
+
+
 def test_notifications_malformed_json_entry_counts_as_failed(app):
     form = _as_qs_dict({"notifications[0]": "{not valid json"})
     status, body = app.send_notifications(form)
@@ -765,6 +818,32 @@ def test_notifications_fcm_invalid_argument_is_failed_not_unknown(app, fake_devi
     status, body = app.send_notifications(_notif_form([entry]))
     assert body == {"unknown": [], "failed": 1}
     assert app.store.get(fake_device.device_identifier) is not None
+
+
+def test_notifications_transient_fcm_error_can_be_retried(app, fake_device):
+    app.register_device(_as_qs_dict(_register_fcm_form(fake_device)))
+    app.fcm_client.result = fcm.FcmResult(
+        status_code=429,
+        error_code="QUOTA_EXCEEDED",
+    )
+    entry = {
+        "deviceIdentifier": fake_device.device_identifier,
+        "pushTokenHash": app.push_token_hash(FAKE_FCM_TOKEN),
+        "subject": base64.b64encode(FAKE_SUBJECT).decode(),
+        "signature": fake_device.sign_subject(FAKE_SUBJECT),
+        "priority": "normal",
+        "type": "alert",
+    }
+
+    first_status, first_body = app.send_notifications(_notif_form([entry]))
+    app.fcm_client.result = FCM_OK_RESULT
+    second_status, second_body = app.send_notifications(_notif_form([entry]))
+
+    assert first_status == HTTPStatus.OK
+    assert first_body == {"unknown": [], "failed": 1}
+    assert second_status == HTTPStatus.OK
+    assert second_body == {"unknown": [], "failed": 0}
+    assert len(app.fcm_client.calls) == 2
 
 
 def test_notifications_apns_device_still_dispatches_to_apns_client(app, fake_device):

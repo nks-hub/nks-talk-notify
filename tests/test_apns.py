@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from app import apns
+from app.provider_errors import ProviderResponseError
 
 
 @pytest.fixture
@@ -169,3 +170,45 @@ def test_client_selects_endpoint_per_registered_environment(ec_key_path):
 
     assert development.calls == []
     assert len(production.calls) == 1
+
+
+def test_client_rejects_non_object_error_response(ec_key_path):
+    path, _key = ec_key_path
+    client = apns.ApnsClient(
+        str(path),
+        key_id="k",
+        team_id="t",
+        topic="com.example.app",
+    )
+
+    class FakeResponse:
+        status_code = 500
+        headers: dict[str, str] = {}
+
+        @staticmethod
+        def json():
+            return []
+
+    class FakeHttpClient:
+        def post(self, path, **kwargs):
+            return FakeResponse()
+
+        def close(self):
+            pass
+
+    for original in client._clients.values():
+        original.close()
+    client._clients = {
+        apns.DEVELOPMENT_ENVIRONMENT: FakeHttpClient(),
+        apns.PRODUCTION_ENVIRONMENT: FakeHttpClient(),
+    }
+    try:
+        with pytest.raises(ProviderResponseError):
+            client.send(
+                device_token="aa" * 32,
+                payload={"aps": {}},
+                push_type="background",
+                priority=5,
+            )
+    finally:
+        client.close()

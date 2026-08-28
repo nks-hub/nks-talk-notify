@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from app import fcm
+from app.provider_errors import ProviderResponseError
 
 
 def _b64url_decode(s: str) -> bytes:
@@ -64,6 +65,34 @@ def test_rejects_non_service_account_json(tmp_path):
     bad.write_text(json.dumps({"client_email": "x@y.iam.gserviceaccount.com"}))  # missing private_key
     with pytest.raises(KeyError):
         fcm.FcmAuthTokenFactory(str(bad))
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(
+            200,
+            content=b"not json",
+            request=httpx.Request("POST", "https://oauth2.googleapis.com/token"),
+        ),
+        httpx.Response(
+            200,
+            json={"token_type": "Bearer"},
+            request=httpx.Request("POST", "https://oauth2.googleapis.com/token"),
+        ),
+    ],
+)
+def test_oauth_response_requires_nonempty_access_token(
+    service_account_path,
+    monkeypatch,
+    response,
+):
+    path, _key = service_account_path
+    factory = fcm.FcmAuthTokenFactory(str(path))
+    monkeypatch.setattr(factory._client, "post", lambda *args, **kwargs: response)
+
+    with pytest.raises(ProviderResponseError):
+        factory.token()
 
 
 # --- FCM v1 payload shape (exercises the real FcmClient.send() code path) --
@@ -138,7 +167,8 @@ def test_error_code_none_on_success():
 
 def test_error_code_none_when_unparseable():
     resp = httpx.Response(500, content=b"not json", request=httpx.Request("POST", "https://fcm.googleapis.com/"))
-    assert fcm._error_code(resp) is None
+    with pytest.raises(ProviderResponseError):
+        fcm._error_code(resp)
 
 
 def test_result_should_forget_device_only_for_unregistered():

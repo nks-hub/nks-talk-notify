@@ -19,6 +19,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
+from .provider_errors import ProviderResponseError
+
 PROD_HOST = "https://api.push.apple.com"
 SANDBOX_HOST = "https://api.sandbox.push.apple.com"
 DEVELOPMENT_ENVIRONMENT = "development"
@@ -141,9 +143,18 @@ class ApnsClient:
         reason = None
         if response.status_code != 200:
             try:
-                reason = response.json().get("reason")
-            except (json.JSONDecodeError, ValueError):
-                reason = None
+                error_payload = response.json()
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise ProviderResponseError(
+                    "APNs error response was not valid JSON"
+                ) from exc
+            if not isinstance(error_payload, dict):
+                raise ProviderResponseError(
+                    "APNs error response was not a JSON object"
+                )
+            reason = error_payload.get("reason")
+            if reason is not None and not isinstance(reason, str):
+                raise ProviderResponseError("APNs error response has invalid reason")
         return ApnsResult(status_code=response.status_code, apns_id=apns_id, reason=reason)
 
 
