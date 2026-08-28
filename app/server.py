@@ -14,6 +14,7 @@ import logging
 import re
 import threading
 import time
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
@@ -107,6 +108,11 @@ class RateLimiter:
             return True
 
 
+@dataclass(frozen=True)
+class ReplayLease:
+    generation: int
+
+
 class ReplayGuard:
     """S5: dedupe (deviceIdentifier, signature) pairs within a TTL window.
 
@@ -118,16 +124,17 @@ class ReplayGuard:
 
     def __init__(self, ttl_seconds: float = 300.0):
         self._ttl = ttl_seconds
-        self._seen: dict[tuple[str, str], tuple[float, bool]] = {}
+        self._seen: dict[tuple[str, str], tuple[float, bool, ReplayLease]] = {}
+        self._generation = 0
         self._lock = threading.Lock()
 
-    def reserve(self, key: tuple[str, str]) -> Optional[bool]:
+    def reserve(self, key: tuple[str, str]) -> ReplayLease | bool:
         """Atomically reserve a delivery key.
 
-        Returns None for a new reservation, False while another request owns
-        the in-flight lease, and True after a successful delivery. A failed
-        provider attempt releases its lease so an upstream retry is not
-        mistaken for a successful replay.
+        Returns an opaque lease for a new reservation, False while another
+        request owns an in-flight lease, and True after a successful delivery.
+        A failed provider attempt releases only its own lease so an upstream
+        retry is neither suppressed nor corrupted by an expired owner.
         """
         now = time.monotonic()
         with self._lock:
@@ -135,23 +142,32 @@ class ReplayGuard:
             # swap for a proper TTL cache if the device count ever makes it hot.
             for stale_key in [
                 k
-                for k, (expires_at, _delivered) in self._seen.items()
+                for k, (expires_at, _delivered, _lease) in self._seen.items()
                 if expires_at < now
             ]:
                 del self._seen[stale_key]
             if key in self._seen:
                 return self._seen[key][1]
-            self._seen[key] = (now + self._ttl, False)
-            return None
+            self._generation += 1
+            lease = ReplayLease(self._generation)
+            self._seen[key] = (now + self._ttl, False, lease)
+            return lease
 
-    def commit(self, key: tuple[str, str]) -> None:
+    def commit(self, key: tuple[str, str], lease: ReplayLease) -> bool:
         with self._lock:
-            if key in self._seen:
-                self._seen[key] = (time.monotonic() + self._ttl, True)
+            current = self._seen.get(key)
+            if current is None or current[2] is not lease:
+                return False
+            self._seen[key] = (time.monotonic() + self._ttl, True, lease)
+            return True
 
-    def release(self, key: tuple[str, str]) -> None:
+    def release(self, key: tuple[str, str], lease: ReplayLease) -> bool:
         with self._lock:
+            current = self._seen.get(key)
+            if current is None or current[2] is not lease:
+                return False
             self._seen.pop(key, None)
+            return True
 
 
 class App:
@@ -339,6 +355,7 @@ class App:
             if replay_state is False:
                 failed += 1  # another request is still delivering it
                 continue
+            replay_lease = replay_state
 
             try:
                 kind = device.push_provider or token_kind(device.push_token)
@@ -355,11 +372,11 @@ class App:
                 else:
                     forget = None  # defensive: registration already rejects anything else
             except Exception:
-                self.replay_guard.release(replay_key)
+                self.replay_guard.release(replay_key, replay_lease)
                 raise
 
             if forget is None:
-                self.replay_guard.release(replay_key)
+                self.replay_guard.release(replay_key, replay_lease)
                 failed += 1
             elif forget:
                 try:
@@ -375,9 +392,9 @@ class App:
                         )
                         failed += 1
                 finally:
-                    self.replay_guard.release(replay_key)
+                    self.replay_guard.release(replay_key, replay_lease)
             else:
-                self.replay_guard.commit(replay_key)
+                self.replay_guard.commit(replay_key, replay_lease)
 
         return HTTPStatus.OK, {"unknown": unknown, "failed": failed}
 

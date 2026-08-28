@@ -9,7 +9,7 @@ import pytest
 from app import apns, fcm
 from app.config import Config
 from app.db import DeviceStore
-from app.server import App, ReplayGuard, token_kind
+from app.server import App, ReplayGuard, ReplayLease, token_kind
 from .conftest import make_fake_device
 
 
@@ -377,12 +377,33 @@ def test_replay_guard_distinguishes_in_flight_and_delivered():
     guard = ReplayGuard()
     key = ("device", "signature")
 
-    assert guard.reserve(key) is None
+    lease = guard.reserve(key)
+    assert isinstance(lease, ReplayLease)
     assert guard.reserve(key) is False
-    guard.commit(key)
+    assert guard.commit(key, lease) is True
     assert guard.reserve(key) is True
-    guard.release(key)
-    assert guard.reserve(key) is None
+    assert guard.release(key, lease) is True
+    assert isinstance(guard.reserve(key), ReplayLease)
+
+
+def test_replay_guard_stale_owner_cannot_mutate_replacement_lease(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("app.server.time.monotonic", lambda: now[0])
+    guard = ReplayGuard(ttl_seconds=1.0)
+    key = ("device", "signature")
+
+    first_lease = guard.reserve(key)
+    assert first_lease not in (None, False, True)
+    now[0] += 2.0
+    replacement_lease = guard.reserve(key)
+    assert replacement_lease not in (None, False, True)
+
+    assert guard.release(key, first_lease) is False
+    assert guard.reserve(key) is False
+    assert guard.commit(key, first_lease) is False
+    assert guard.reserve(key) is False
+    assert guard.commit(key, replacement_lease) is True
+    assert guard.reserve(key) is True
 
 
 def test_notifications_410_forgets_device_and_reports_unknown(app, fake_device):
