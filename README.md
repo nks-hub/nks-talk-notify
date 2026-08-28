@@ -405,7 +405,11 @@ push. A repeat after success is silently dropped (counted as neither
 `failed` nor `unknown`), a concurrent repeat while the first send is still
 running counts as `failed`, and a transient provider failure releases the
 lease so a later retry can actually reach APNs or FCM instead of being
-misreported as already delivered.
+misreported as already delivered. Active leases do not expire while a
+provider call is in flight; provider clients have a 10-second network timeout.
+Committed entries expire after five minutes. The guard holds at most 16,384
+active and committed entries combined; a new key at that ceiling counts as
+`failed` instead of growing memory without a bound.
 
 The lease is intentionally in-memory; it is not a durable retry queue.
 Current Nextcloud logs the proxy's non-zero `failed` count but does not
