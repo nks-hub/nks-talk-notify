@@ -9,7 +9,7 @@ import pytest
 from app import apns, fcm
 from app.config import Config
 from app.db import DeviceStore
-from app.server import App, token_kind
+from app.server import App, ReplayGuard, token_kind
 from .conftest import make_fake_device
 
 
@@ -373,6 +373,18 @@ def test_notifications_replay_is_silently_dropped(app, fake_device):
     assert len(app.apns_client.calls) == 1  # APNs only actually called once
 
 
+def test_replay_guard_distinguishes_in_flight_and_delivered():
+    guard = ReplayGuard()
+    key = ("device", "signature")
+
+    assert guard.reserve(key) is None
+    assert guard.reserve(key) is False
+    guard.commit(key)
+    assert guard.reserve(key) is True
+    guard.release(key)
+    assert guard.reserve(key) is None
+
+
 def test_notifications_410_forgets_device_and_reports_unknown(app, fake_device):
     app.register_device(_as_qs_dict(_register_form(fake_device)))
     app.apns_client.result = apns.ApnsResult(status_code=410, apns_id=None, reason="Unregistered")
@@ -452,6 +464,33 @@ def test_notifications_transient_apns_error_keeps_device_and_counts_failed(app, 
     status, body = app.send_notifications(_notif_form([entry]))
     assert body == {"unknown": [], "failed": 1}
     assert app.store.get(fake_device.device_identifier) is not None
+
+
+def test_notifications_transient_apns_error_can_be_retried(app, fake_device):
+    app.register_device(_as_qs_dict(_register_form(fake_device)))
+    app.apns_client.result = apns.ApnsResult(
+        status_code=429,
+        apns_id=None,
+        reason="TooManyRequests",
+    )
+    entry = {
+        "deviceIdentifier": fake_device.device_identifier,
+        "pushTokenHash": app.push_token_hash("aa" * 32),
+        "subject": base64.b64encode(FAKE_SUBJECT).decode(),
+        "signature": fake_device.sign_subject(FAKE_SUBJECT),
+        "priority": "normal",
+        "type": "alert",
+    }
+
+    first_status, first_body = app.send_notifications(_notif_form([entry]))
+    app.apns_client.result = OK_RESULT
+    second_status, second_body = app.send_notifications(_notif_form([entry]))
+
+    assert first_status == HTTPStatus.OK
+    assert first_body == {"unknown": [], "failed": 1}
+    assert second_status == HTTPStatus.OK
+    assert second_body == {"unknown": [], "failed": 0}
+    assert len(app.apns_client.calls) == 2
 
 
 def test_notifications_malformed_json_entry_counts_as_failed(app):

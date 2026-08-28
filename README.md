@@ -399,10 +399,21 @@ exposure, since the signature alone is what authenticates a
 with the real Nextcloud server, which is not this proxy's protocol to
 change. What we *do* control is bounding the blast radius: dedupe by
 `(deviceIdentifier, signature)` within a 5-minute TTL, so a captured entry
-can be replayed at most once per window rather than indefinitely. A
-repeat within that window is silently dropped (counted as neither
-`failed` nor `unknown`, i.e. treated as already delivered) instead of
-triggering a second APNs push.
+can be replayed at most once per window rather than indefinitely. The guard
+uses an in-flight lease and only commits it after the provider accepts the
+push. A repeat after success is silently dropped (counted as neither
+`failed` nor `unknown`), a concurrent repeat while the first send is still
+running counts as `failed`, and a transient provider failure releases the
+lease so a later retry can actually reach APNs or FCM instead of being
+misreported as already delivered.
+
+The lease is intentionally in-memory; it is not a durable retry queue.
+Current Nextcloud logs the proxy's non-zero `failed` count but does not
+re-enqueue that encrypted payload. Persisting retries here would therefore
+need a real bounded outbox with expiry, cancellation for stale/delete pushes,
+and crash-safe leases -- not an inline HTTP retry that can duplicate or show
+stale notifications. Until that protocol slice exists, a later identical
+request is safe to retry, but the proxy does not invent one on its own.
 
 **Storage.** `push_token` (the real APNs device token) is stored in
 cleartext SQLite, file permissions restricted to the container user

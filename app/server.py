@@ -118,20 +118,40 @@ class ReplayGuard:
 
     def __init__(self, ttl_seconds: float = 300.0):
         self._ttl = ttl_seconds
-        self._seen: dict[tuple[str, str], float] = {}
+        self._seen: dict[tuple[str, str], tuple[float, bool]] = {}
         self._lock = threading.Lock()
 
-    def seen_before(self, key: tuple[str, str]) -> bool:
+    def reserve(self, key: tuple[str, str]) -> Optional[bool]:
+        """Atomically reserve a delivery key.
+
+        Returns None for a new reservation, False while another request owns
+        the in-flight lease, and True after a successful delivery. A failed
+        provider attempt releases its lease so an upstream retry is not
+        mistaken for a successful replay.
+        """
         now = time.monotonic()
         with self._lock:
             # ponytail: O(n) prune on every write; fine at this proxy's scale,
             # swap for a proper TTL cache if the device count ever makes it hot.
-            for stale_key in [k for k, expires_at in self._seen.items() if expires_at < now]:
+            for stale_key in [
+                k
+                for k, (expires_at, _delivered) in self._seen.items()
+                if expires_at < now
+            ]:
                 del self._seen[stale_key]
             if key in self._seen:
-                return True
-            self._seen[key] = now + self._ttl
-            return False
+                return self._seen[key][1]
+            self._seen[key] = (now + self._ttl, False)
+            return None
+
+    def commit(self, key: tuple[str, str]) -> None:
+        with self._lock:
+            if key in self._seen:
+                self._seen[key] = (time.monotonic() + self._ttl, True)
+
+    def release(self, key: tuple[str, str]) -> None:
+        with self._lock:
+            self._seen.pop(key, None)
 
 
 class App:
@@ -312,38 +332,52 @@ class App:
                 failed += 1
                 continue
 
-            if self.replay_guard.seen_before((device_identifier, signature)):  # S5
+            replay_key = (device_identifier, signature)
+            replay_state = self.replay_guard.reserve(replay_key)  # S5
+            if replay_state is True:
                 continue  # already delivered once, silently drop the repeat
+            if replay_state is False:
+                failed += 1  # another request is still delivering it
+                continue
 
-            kind = device.push_provider or token_kind(device.push_token)
-            if kind == "apns":
-                forget = self._send_via_apns(
-                    device.push_token,
-                    subject,
-                    nc_type,
-                    nc_priority,
-                    device.push_environment,
-                )
-            elif kind == "fcm":
-                forget = self._send_via_fcm(device.push_token, subject, nc_priority)
-            else:
-                forget = None  # defensive: registration already rejects anything else
+            try:
+                kind = device.push_provider or token_kind(device.push_token)
+                if kind == "apns":
+                    forget = self._send_via_apns(
+                        device.push_token,
+                        subject,
+                        nc_type,
+                        nc_priority,
+                        device.push_environment,
+                    )
+                elif kind == "fcm":
+                    forget = self._send_via_fcm(device.push_token, subject, nc_priority)
+                else:
+                    forget = None  # defensive: registration already rejects anything else
+            except Exception:
+                self.replay_guard.release(replay_key)
+                raise
 
             if forget is None:
+                self.replay_guard.release(replay_key)
                 failed += 1
             elif forget:
-                if self.deletion_breaker.allow("fleet"):
-                    self.store.delete(device_identifier)
-                    unknown.append(device_identifier)
-                else:
-                    log.error(
-                        "deletion breaker tripped -- refusing to forget %s (dead-token deletions exceeded the "
-                        "hourly budget). Likely cause: the APNs environment or FCM credentials don't match what "
-                        "your devices actually registered under -- check that before assuming devices are gone.",
-                        device_identifier,
-                    )
-                    failed += 1
-            # forget is False: delivered fine, nothing to do
+                try:
+                    if self.deletion_breaker.allow("fleet"):
+                        self.store.delete(device_identifier)
+                        unknown.append(device_identifier)
+                    else:
+                        log.error(
+                            "deletion breaker tripped -- refusing to forget %s (dead-token deletions exceeded the "
+                            "hourly budget). Likely cause: the APNs environment or FCM credentials don't match what "
+                            "your devices actually registered under -- check that before assuming devices are gone.",
+                            device_identifier,
+                        )
+                        failed += 1
+                finally:
+                    self.replay_guard.release(replay_key)
+            else:
+                self.replay_guard.commit(replay_key)
 
         return HTTPStatus.OK, {"unknown": unknown, "failed": failed}
 
