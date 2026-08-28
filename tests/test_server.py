@@ -444,7 +444,7 @@ def test_notifications_410_forgets_device_and_reports_unknown(app, fake_device):
     assert app.store.get(fake_device.device_identifier) is None
 
 
-def test_notifications_deletion_breaker_caps_mass_deletion(app):
+def test_notifications_deletion_breaker_caps_mass_deletion(app, caplog):
     """Regression guard for the sandbox/production APNs mismatch scenario:
     every registered device looks dead at once (BadDeviceToken), and without
     a budget this would silently deregister the entire fleet in one pass."""
@@ -463,12 +463,15 @@ def test_notifications_deletion_breaker_caps_mass_deletion(app):
         })
     app.apns_client.result = apns.ApnsResult(status_code=410, apns_id=None, reason="Unregistered")
 
-    status, body = app.send_notifications(_notif_form(entries))
+    with caplog.at_level("ERROR", logger="nks-talk-notify"):
+        status, body = app.send_notifications(_notif_form(entries))
 
     assert len(body["unknown"]) == 10  # the deletion_breaker's capacity
     assert body["failed"] == 1  # the 11th got refused, not silently forgotten
     surviving = [d for d in devices if app.store.get(d.device_identifier) is not None]
     assert len(surviving) == 1, "exactly one device should have been protected by the breaker"
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert all(device.device_identifier not in messages for device in devices)
 
 
 def test_notifications_deletion_breaker_caps_lookup_misses(app):

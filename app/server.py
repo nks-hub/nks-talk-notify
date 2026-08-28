@@ -427,10 +427,10 @@ class App:
                         unknown.append(device_identifier)
                     else:
                         log.error(
-                            "deletion breaker tripped -- refusing to forget %s (dead-token deletions exceeded the "
+                            "deletion breaker tripped -- refusing to forget a dead-token registration "
+                            "(deletions exceeded the "
                             "hourly budget). Likely cause: the APNs environment or FCM credentials don't match what "
-                            "your devices actually registered under -- check that before assuming devices are gone.",
-                            device_identifier,
+                            "your devices actually registered under -- check that before assuming devices are gone."
                         )
                         failed += 1
                 finally:
