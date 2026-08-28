@@ -8,6 +8,7 @@ exact Nextcloud source lines it was verified against.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import hmac
 import json
 import logging
@@ -65,6 +66,7 @@ MAX_NOTIFICATIONS_PER_REQUEST = 100  # S4: cap batch size
 # reverse proxy finish relaying a realistically-oversized body so it can
 # deliver our 413 cleanly, not to define what we accept.
 _DRAIN_CAP_BYTES = 8 * 1024 * 1024
+_MAX_REPLAY_ENTRIES = 16_384
 
 
 _BUCKET_IDLE_SECONDS = 3600.0  # S5: forget a fully-refilled bucket after this long unused
@@ -115,6 +117,13 @@ class ReplayLease:
     generation: int
 
 
+@dataclass
+class _ReplayEntry:
+    lease: ReplayLease
+    delivered: bool = False
+    expires_at: Optional[float] = None
+
+
 class ReplayGuard:
     """S5: dedupe (deviceIdentifier, signature) pairs within a TTL window.
 
@@ -124,9 +133,17 @@ class ReplayGuard:
     catch one a week later to be useful.
     """
 
-    def __init__(self, ttl_seconds: float = 300.0):
+    def __init__(
+        self,
+        ttl_seconds: float = 300.0,
+        max_entries: int = _MAX_REPLAY_ENTRIES,
+    ):
+        if ttl_seconds <= 0 or max_entries <= 0:
+            raise ValueError("Replay guard limits must be positive")
         self._ttl = ttl_seconds
-        self._seen: dict[tuple[str, str], tuple[float, bool, ReplayLease]] = {}
+        self._max_entries = max_entries
+        self._seen: dict[tuple[str, str], _ReplayEntry] = {}
+        self._expiries: list[tuple[float, int, tuple[str, str]]] = []
         self._generation = 0
         self._lock = threading.Lock()
 
@@ -140,36 +157,51 @@ class ReplayGuard:
         """
         now = time.monotonic()
         with self._lock:
-            # ponytail: O(n) prune on every write; fine at this proxy's scale,
-            # swap for a proper TTL cache if the device count ever makes it hot.
-            for stale_key in [
-                k
-                for k, (expires_at, _delivered, _lease) in self._seen.items()
-                if expires_at < now
-            ]:
-                del self._seen[stale_key]
-            if key in self._seen:
-                return self._seen[key][1]
+            self._prune_delivered(now)
+            current = self._seen.get(key)
+            if current is not None:
+                return current.delivered
+            if len(self._seen) >= self._max_entries:
+                return False
             self._generation += 1
             lease = ReplayLease(self._generation)
-            self._seen[key] = (now + self._ttl, False, lease)
+            self._seen[key] = _ReplayEntry(lease=lease)
             return lease
 
     def commit(self, key: tuple[str, str], lease: ReplayLease) -> bool:
         with self._lock:
             current = self._seen.get(key)
-            if current is None or current[2] is not lease:
+            if current is None or current.lease is not lease:
                 return False
-            self._seen[key] = (time.monotonic() + self._ttl, True, lease)
+            if current.delivered:
+                return True
+            current.delivered = True
+            current.expires_at = time.monotonic() + self._ttl
+            heapq.heappush(
+                self._expiries,
+                (current.expires_at, lease.generation, key),
+            )
             return True
 
     def release(self, key: tuple[str, str], lease: ReplayLease) -> bool:
         with self._lock:
             current = self._seen.get(key)
-            if current is None or current[2] is not lease:
+            if current is None or current.lease is not lease:
                 return False
             self._seen.pop(key, None)
             return True
+
+    def _prune_delivered(self, now: float) -> None:
+        while self._expiries and self._expiries[0][0] < now:
+            expires_at, generation, key = heapq.heappop(self._expiries)
+            current = self._seen.get(key)
+            if (
+                current is not None
+                and current.delivered
+                and current.expires_at == expires_at
+                and current.lease.generation == generation
+            ):
+                del self._seen[key]
 
 
 class App:
@@ -403,7 +435,9 @@ class App:
                 finally:
                     self.replay_guard.release(replay_key, replay_lease)
             else:
-                self.replay_guard.commit(replay_key, replay_lease)
+                if not self.replay_guard.commit(replay_key, replay_lease):
+                    log.error("replay lease state was lost after provider acceptance")
+                    failed += 1
 
         return HTTPStatus.OK, {"unknown": unknown, "failed": failed}
 

@@ -387,24 +387,43 @@ def test_replay_guard_distinguishes_in_flight_and_delivered():
     assert isinstance(guard.reserve(key), ReplayLease)
 
 
-def test_replay_guard_stale_owner_cannot_mutate_replacement_lease(monkeypatch):
+def test_replay_guard_in_flight_lease_does_not_expire(monkeypatch):
     now = [100.0]
     monkeypatch.setattr("app.server.time.monotonic", lambda: now[0])
     guard = ReplayGuard(ttl_seconds=1.0)
     key = ("device", "signature")
 
-    first_lease = guard.reserve(key)
-    assert first_lease not in (None, False, True)
+    lease = guard.reserve(key)
+    assert isinstance(lease, ReplayLease)
     now[0] += 2.0
-    replacement_lease = guard.reserve(key)
-    assert replacement_lease not in (None, False, True)
-
-    assert guard.release(key, first_lease) is False
     assert guard.reserve(key) is False
-    assert guard.commit(key, first_lease) is False
-    assert guard.reserve(key) is False
-    assert guard.commit(key, replacement_lease) is True
+    assert guard.commit(key, lease) is True
     assert guard.reserve(key) is True
+
+
+def test_replay_guard_prunes_delivered_entry_after_ttl(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("app.server.time.monotonic", lambda: now[0])
+    guard = ReplayGuard(ttl_seconds=1.0)
+    key = ("device", "signature")
+
+    lease = guard.reserve(key)
+    assert isinstance(lease, ReplayLease)
+    assert guard.commit(key, lease) is True
+    now[0] += 2.0
+    assert isinstance(guard.reserve(key), ReplayLease)
+
+
+def test_replay_guard_rejects_new_keys_at_capacity():
+    guard = ReplayGuard(max_entries=2)
+    first = guard.reserve(("device-1", "signature"))
+    second = guard.reserve(("device-2", "signature"))
+    assert isinstance(first, ReplayLease)
+    assert isinstance(second, ReplayLease)
+
+    assert guard.reserve(("device-3", "signature")) is False
+    assert guard.release(("device-1", "signature"), first) is True
+    assert isinstance(guard.reserve(("device-3", "signature")), ReplayLease)
 
 
 def test_notifications_410_forgets_device_and_reports_unknown(app, fake_device):
