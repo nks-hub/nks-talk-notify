@@ -20,6 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 
+import httpx
+
 from . import apns, crypto, fcm
 from .config import Config
 from .db import DeviceStore, PublicKeyMismatch
@@ -371,6 +373,13 @@ class App:
                     forget = self._send_via_fcm(device.push_token, subject, nc_priority)
                 else:
                     forget = None  # defensive: registration already rejects anything else
+            except httpx.HTTPError as exc:
+                log.warning(
+                    "push provider request failed: provider=%s error=%s",
+                    kind,
+                    type(exc).__name__,
+                )
+                forget = None
             except Exception:
                 self.replay_guard.release(replay_key, replay_lease)
                 raise

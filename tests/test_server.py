@@ -4,6 +4,7 @@ import base64
 import json
 from http import HTTPStatus
 
+import httpx
 import pytest
 
 from app import apns, fcm
@@ -512,6 +513,37 @@ def test_notifications_transient_apns_error_can_be_retried(app, fake_device):
     assert second_status == HTTPStatus.OK
     assert second_body == {"unknown": [], "failed": 0}
     assert len(app.apns_client.calls) == 2
+
+
+def test_notifications_apns_transport_error_counts_failed_and_can_be_retried(
+    app,
+    fake_device,
+):
+    class UnreachableApnsClient:
+        def send(self, **kwargs):
+            raise httpx.ConnectTimeout("test timeout")
+
+    app.register_device(_as_qs_dict(_register_form(fake_device)))
+    app.apns_client = UnreachableApnsClient()
+    entry = {
+        "deviceIdentifier": fake_device.device_identifier,
+        "pushTokenHash": app.push_token_hash("aa" * 32),
+        "subject": base64.b64encode(FAKE_SUBJECT).decode(),
+        "signature": fake_device.sign_subject(FAKE_SUBJECT),
+        "priority": "normal",
+        "type": "alert",
+    }
+
+    first_status, first_body = app.send_notifications(_notif_form([entry]))
+    retry_client = FakeApnsClient(OK_RESULT)
+    app.apns_client = retry_client
+    second_status, second_body = app.send_notifications(_notif_form([entry]))
+
+    assert first_status == HTTPStatus.OK
+    assert first_body == {"unknown": [], "failed": 1}
+    assert second_status == HTTPStatus.OK
+    assert second_body == {"unknown": [], "failed": 0}
+    assert len(retry_client.calls) == 1
 
 
 def test_notifications_malformed_json_entry_counts_as_failed(app):
