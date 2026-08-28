@@ -152,9 +152,10 @@ class ReplayGuard:
         """Atomically reserve a delivery key.
 
         Returns an opaque lease for a new reservation, False while another
-        request owns an in-flight lease, and True after a successful delivery.
-        A failed provider attempt releases only its own lease so an upstream
-        retry is neither suppressed nor corrupted by an expired owner.
+        request owns an in-flight lease or the guard is at capacity, and True
+        after a successful delivery. A failed provider attempt releases only
+        its own lease so an upstream retry is neither suppressed nor corrupted
+        by an expired owner.
         """
         now = time.monotonic()
         with self._lock:
@@ -187,7 +188,11 @@ class ReplayGuard:
     def release(self, key: tuple[str, str], lease: ReplayLease) -> bool:
         with self._lock:
             current = self._seen.get(key)
-            if current is None or current.lease is not lease:
+            if (
+                current is None
+                or current.lease is not lease
+                or current.delivered
+            ):
                 return False
             self._seen.pop(key, None)
             return True

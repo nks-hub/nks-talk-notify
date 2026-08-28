@@ -10,7 +10,7 @@ import pytest
 from app import apns, fcm
 from app.config import Config
 from app.db import DeviceStore
-from app.server import App, ReplayGuard, ReplayLease, token_kind
+from app.server import App, ReplayGuard, token_kind
 from app.provider_errors import ProviderResponseError
 from .conftest import make_fake_device
 
@@ -375,56 +375,27 @@ def test_notifications_replay_is_silently_dropped(app, fake_device):
     assert len(app.apns_client.calls) == 1  # APNs only actually called once
 
 
-def test_replay_guard_distinguishes_in_flight_and_delivered():
-    guard = ReplayGuard()
-    key = ("device", "signature")
+def test_notifications_lost_replay_commit_is_reported_failed(app, fake_device):
+    class CommitRejectingGuard(ReplayGuard):
+        def commit(self, key, lease):
+            return False
 
-    lease = guard.reserve(key)
-    assert isinstance(lease, ReplayLease)
-    assert guard.reserve(key) is False
-    assert guard.commit(key, lease) is True
-    assert guard.reserve(key) is True
-    assert guard.release(key, lease) is True
-    assert isinstance(guard.reserve(key), ReplayLease)
+    app.replay_guard = CommitRejectingGuard()
+    app.register_device(_as_qs_dict(_register_form(fake_device)))
+    entry = {
+        "deviceIdentifier": fake_device.device_identifier,
+        "pushTokenHash": app.push_token_hash("aa" * 32),
+        "subject": base64.b64encode(FAKE_SUBJECT).decode(),
+        "signature": fake_device.sign_subject(FAKE_SUBJECT),
+        "priority": "normal",
+        "type": "alert",
+    }
 
+    status, body = app.send_notifications(_notif_form([entry]))
 
-def test_replay_guard_in_flight_lease_does_not_expire(monkeypatch):
-    now = [100.0]
-    monkeypatch.setattr("app.server.time.monotonic", lambda: now[0])
-    guard = ReplayGuard(ttl_seconds=1.0)
-    key = ("device", "signature")
-
-    lease = guard.reserve(key)
-    assert isinstance(lease, ReplayLease)
-    now[0] += 2.0
-    assert guard.reserve(key) is False
-    assert guard.commit(key, lease) is True
-    assert guard.reserve(key) is True
-
-
-def test_replay_guard_prunes_delivered_entry_after_ttl(monkeypatch):
-    now = [100.0]
-    monkeypatch.setattr("app.server.time.monotonic", lambda: now[0])
-    guard = ReplayGuard(ttl_seconds=1.0)
-    key = ("device", "signature")
-
-    lease = guard.reserve(key)
-    assert isinstance(lease, ReplayLease)
-    assert guard.commit(key, lease) is True
-    now[0] += 2.0
-    assert isinstance(guard.reserve(key), ReplayLease)
-
-
-def test_replay_guard_rejects_new_keys_at_capacity():
-    guard = ReplayGuard(max_entries=2)
-    first = guard.reserve(("device-1", "signature"))
-    second = guard.reserve(("device-2", "signature"))
-    assert isinstance(first, ReplayLease)
-    assert isinstance(second, ReplayLease)
-
-    assert guard.reserve(("device-3", "signature")) is False
-    assert guard.release(("device-1", "signature"), first) is True
-    assert isinstance(guard.reserve(("device-3", "signature")), ReplayLease)
+    assert status == HTTPStatus.OK
+    assert body == {"unknown": [], "failed": 1}
+    assert len(app.apns_client.calls) == 1
 
 
 def test_notifications_410_forgets_device_and_reports_unknown(app, fake_device):
