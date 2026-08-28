@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import threading
 import urllib.error
 import urllib.request
@@ -11,6 +12,7 @@ from urllib.parse import urlencode
 import pytest
 
 from app.db import DeviceStore
+from app.config import ConfigError
 from app.server import run_server
 from .test_server import (
     FAKE_SUBJECT,
@@ -456,3 +458,21 @@ def test_rate_limiter_evicts_idle_full_buckets(monkeypatch):
 
     limiter.allow("visitor-2")  # any call prunes stale buckets first
     assert "visitor-1" not in limiter._buckets, "idle, fully-refilled bucket should have been evicted"
+
+
+def test_main_suppresses_httpx_request_urls(monkeypatch):
+    from app import __main__ as entrypoint
+
+    httpx_log = logging.getLogger("httpx")
+    original_level = httpx_log.level
+
+    def fail_config(cls):
+        raise ConfigError("test stop after logging setup")
+
+    monkeypatch.setattr(entrypoint.Config, "from_env", classmethod(fail_config))
+    httpx_log.setLevel(logging.NOTSET)
+    try:
+        assert entrypoint.main() == 1
+        assert httpx_log.level == logging.WARNING
+    finally:
+        httpx_log.setLevel(original_level)

@@ -652,12 +652,15 @@ own decisions, but the access log line itself does not — don't conclude
 from it that traffic came from inside the network. A real client IP, if
 you need one, is in the reverse proxy's own access log, not here.
 
-An FCM send logs two lines worth telling apart: `POST
-https://oauth2.googleapis.com/token` is the JWT→access-token exchange
-(fails here = bad service account, wrong key, or Google-side auth
-problem); `POST https://fcm.googleapis.com/v1/projects/.../messages:send`
-is the actual push (fails here with a `4xx` = auth was fine, the *message*
-was rejected — see the FCM error-code table under Security model).
+Provider-client request logging is suppressed below WARNING. `httpx` includes
+the complete URL in every INFO access line, and APNs places the device token
+directly in `/3/device/<token>`; keeping those otherwise-useful lines would
+persist real push tokens in container logs. This service's own failure logs
+remain: APNs reports status/reason and FCM reports status/error code without
+including the token. An FCM OAuth failure therefore still points to service
+account/authentication configuration, while a send failure points to the
+message or registration token (see the error-code table under Security
+model), but successful provider requests are intentionally quiet.
 
 ### Live verification against the running proxy
 

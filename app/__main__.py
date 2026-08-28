@@ -13,6 +13,9 @@ from .server import run_server
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # httpx logs complete request URLs at INFO. APNs puts the device token in
+    # /3/device/<token>, so provider access lines must never reach stdout.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     log = logging.getLogger("nks-talk-notify")
 
     try:
