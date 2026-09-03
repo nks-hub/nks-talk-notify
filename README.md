@@ -459,6 +459,7 @@ See `.env.example` for the full annotated list. Summary:
 | `DB_PATH` | no (default `/data/devices.db`) | SQLite file |
 | `LISTEN_HOST` / `LISTEN_PORT` | no (default `0.0.0.0` / `8080`) | bind address (container-internal) |
 | `NEXTCLOUD_SUBSCRIPTION_KEY` | no (unset disables `/notifications` with `401` and logs a startup warning) | matches Nextcloud's `X-Nextcloud-Subscription-Key`, see Security model |
+| `NEXTCLOUD_SUBSCRIPTION_KEYS` | no | comma-separated keys of further Nextcloud servers sharing this proxy; each server keeps its own `push_subscription_key`, any listed key is accepted on `/notifications` |
 | `APNS_KEY_HOST_PATH` | docker-compose only | absolute host path to the real `.p8` file |
 | `FCM_SERVICE_ACCOUNT_HOST_PATH` | docker-compose only | absolute host path to the real service account JSON |
 | `BIND_ADDR` | docker-compose only (default `127.0.0.1`) | host address the container port is published on — see Security model |

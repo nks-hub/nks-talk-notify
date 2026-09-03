@@ -207,6 +207,32 @@ def test_notifications_accepts_correct_subscription_key(tmp_path, fake_device):
         store.close()
 
 
+def test_notifications_accepts_any_of_several_server_keys(tmp_path, fake_device):
+    # Two Nextcloud servers behind one proxy, each with its own key.
+    base_url, fake, server, store = _start_live_server(
+        tmp_path,
+        nextcloud_subscription_key="s3cr3t",
+        nextcloud_subscription_keys=("second-server-key",),
+    )
+    try:
+        for key, expected in (("second-server-key", 200), ("s3cr3t", 200), ("stranger", 401)):
+            req = urllib.request.Request(
+                f"{base_url}/notifications",
+                data=urlencode({"notifications[0]": json.dumps({"deviceIdentifier": "nope", "pushTokenHash": "x", "subject": "x", "signature": "x"})}).encode(),
+                method="POST",
+                headers={"X-Nextcloud-Subscription-Key": key},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    assert resp.status == expected
+            except urllib.error.HTTPError as e:
+                assert e.code == expected
+    finally:
+        server.shutdown()
+        server.server_close()
+        store.close()
+
+
 def test_devices_endpoint_is_not_gated_by_subscription_key(tmp_path, fake_device):
     """S1: the header only ever comes from Nextcloud's server-to-proxy call,
     never from the client's own registration -- /devices must stay reachable."""

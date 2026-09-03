@@ -28,6 +28,13 @@ class Config:
     listen_port: int
     nextcloud_subscription_key: str
     trusted_proxy_ip: str
+    nextcloud_subscription_keys: tuple[str, ...] = ()
+
+    @property
+    def subscription_keys(self) -> tuple[str, ...]:
+        """Every key a Nextcloud server may present on POST /notifications."""
+        keys = [self.nextcloud_subscription_key, *self.nextcloud_subscription_keys]
+        return tuple(dict.fromkeys(key for key in keys if key))
 
     @property
     def apns_enabled(self) -> bool:
@@ -61,6 +68,14 @@ class Config:
             # URL is registered as the server's `subscription_aware_server`.
             # Empty = /notifications rejects everyone (fail closed, warn at startup).
             nextcloud_subscription_key=os.environ.get("NEXTCLOUD_SUBSCRIPTION_KEY", "").strip(),
+            # Several Nextcloud servers may share one proxy; each generates its
+            # own push_subscription_key. NEXTCLOUD_SUBSCRIPTION_KEYS lists them
+            # comma-separated; the singular variable stays valid on its own.
+            nextcloud_subscription_keys=tuple(
+                key.strip()
+                for key in os.environ.get("NEXTCLOUD_SUBSCRIPTION_KEYS", "").split(",")
+                if key.strip()
+            ),
             # S3/S5: the one peer address allowed to set X-Forwarded-For for
             # rate-limiting purposes -- the reverse proxy in front of this
             # service. Empty = never trust X-Forwarded-For, always rate-limit

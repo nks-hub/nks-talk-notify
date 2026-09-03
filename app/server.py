@@ -673,8 +673,9 @@ def make_handler(app: App):
                 # /devices doesn't get this: it's never the caller that would
                 # send this header (Nextcloud is), so it stays gated purely
                 # by the deviceIdentifier signature + key pin as designed.
-                key = app.config.nextcloud_subscription_key
-                if not key or not hmac.compare_digest(self.headers.get("X-Nextcloud-Subscription-Key", ""), key):
+                presented = self.headers.get("X-Nextcloud-Subscription-Key", "")
+                keys = app.config.subscription_keys
+                if not keys or not any(hmac.compare_digest(presented, key) for key in keys):
                     self._send_json(HTTPStatus.UNAUTHORIZED, {"message": "UNAUTHORIZED"})
                     return
                 if not app.notifications_rate_limiter.allow(self._client_ip()):  # S3

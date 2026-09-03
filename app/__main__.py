@@ -24,7 +24,7 @@ def main() -> int:
         log.error("configuration error: %s", exc)
         return 1
 
-    if not config.nextcloud_subscription_key:
+    if not config.subscription_keys:
         log.warning(
             "NEXTCLOUD_SUBSCRIPTION_KEY is not set -- POST /notifications is disabled and returns "
             "401 until the matching Nextcloud subscription key is configured (see README)."
