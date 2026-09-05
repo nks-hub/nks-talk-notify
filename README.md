@@ -81,6 +81,7 @@ Form-urlencoded body:
 | `deviceIdentifier` | `base64(sha512(preimage))`, exactly as Nextcloud returned it |
 | `deviceIdentifierSignature` | `base64(signature)`, exactly as Nextcloud returned it |
 | `userPublicKey` | `publicKey`, exactly as Nextcloud returned it |
+| `voipToken` | optional, APNs only: the device's PushKit token, in the same hex shape as `pushToken` and never equal to it |
 
 **Client contract that is not visible in this repo:** the `pushTokenHash`
 the client sends to *Nextcloud* must equal `sha512(pushToken)` computed the
@@ -101,6 +102,17 @@ not an identity. APNs tokens must be 64-200 lowercase hex characters and carry
 `[A-Za-z0-9_:-]` whitelist at 32-4096 characters and must not carry an APNs
 environment. Rows created before `pushProvider` existed keep a null provider;
 only those legacy rows use `token_kind()` shape inference during delivery.
+
+`voipToken` is what makes a call ring on iOS. Apple delivers a VoIP push
+only through PushKit, which has a device token of its own and the
+`<topic>.voip` topic; the same push sent to the ordinary token is refused as
+`DeviceTokenNotForTopic`. A device that registers one gets Nextcloud's
+`type=voip` notifications as real VoIP pushes; a device without one — every
+client from before this field existed, and every non-iOS client — gets them
+as ordinary alerts instead, so a call still arrives. A `voipToken` on an FCM
+registration, or one that is not an APNs token, is refused with
+`INVALID_VOIP_TOKEN`. When APNs rejects a VoIP token as dead, only that
+token is forgotten: the row and its alert delivery stay.
 
 Responses: `200` empty body on success (matches what current official
 clients expect), `400` on a missing/invalid field or a signature that

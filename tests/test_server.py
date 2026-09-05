@@ -334,10 +334,9 @@ def test_notifications_bad_subject_signature_counts_as_failed(app, fake_device):
     assert body == {"unknown": [], "failed": 1}
 
 
-def test_notifications_success_calls_apns_with_mapped_priority(app, fake_device):
-    app.register_device(_as_qs_dict(_register_form(fake_device)))
-    subject = FAKE_SUBJECT
-    entry = {
+def _call_entry(app, fake_device, subject=None):
+    subject = FAKE_SUBJECT if subject is None else subject
+    return {
         "deviceIdentifier": fake_device.device_identifier,
         "pushTokenHash": app.push_token_hash("aa" * 32),
         "subject": base64.b64encode(subject).decode(),
@@ -345,15 +344,84 @@ def test_notifications_success_calls_apns_with_mapped_priority(app, fake_device)
         "priority": "high",
         "type": "voip",
     }
-    status, body = app.send_notifications(_notif_form([entry]))
+
+
+def test_notifications_success_calls_apns_with_mapped_priority(app, fake_device):
+    """A call to a device with no PushKit token still rings, as an alert.
+
+    A VoIP push needs the PushKit token and the `.voip` topic; sent to the
+    ordinary token APNs answers DeviceTokenNotForTopic, so the call would be
+    lost. Every client from before `voipToken` existed is in exactly that
+    state.
+    """
+    app.register_device(_as_qs_dict(_register_form(fake_device)))
+    subject = FAKE_SUBJECT
+    status, body = app.send_notifications(_notif_form([_call_entry(app, fake_device, subject)]))
     assert status == HTTPStatus.OK
     assert body == {"unknown": [], "failed": 0}
     assert len(app.apns_client.calls) == 1
     call = app.apns_client.calls[0]
     assert call["device_token"] == "aa" * 32
-    assert call["push_type"] == "voip"
+    assert call["push_type"] == "alert"
     assert call["priority"] == 10
     assert call["payload"]["nc-subject"] == base64.b64encode(subject).decode()
+
+
+def test_notifications_call_goes_to_the_pushkit_token(app, fake_device):
+    form = _register_form(fake_device)
+    form["voipToken"] = "bb" * 32
+    app.register_device(_as_qs_dict(form))
+    status, body = app.send_notifications(_notif_form([_call_entry(app, fake_device)]))
+    assert status == HTTPStatus.OK
+    assert body == {"unknown": [], "failed": 0}
+    call = app.apns_client.calls[0]
+    assert call["device_token"] == "bb" * 32
+    assert call["push_type"] == "voip"
+
+
+def test_notifications_ordinary_push_never_goes_to_the_pushkit_token(app, fake_device):
+    form = _register_form(fake_device)
+    form["voipToken"] = "bb" * 32
+    app.register_device(_as_qs_dict(form))
+    entry = _call_entry(app, fake_device)
+    entry["type"] = "alert"
+    app.send_notifications(_notif_form([entry]))
+    call = app.apns_client.calls[0]
+    assert call["device_token"] == "aa" * 32
+    assert call["push_type"] == "alert"
+
+
+def test_a_dead_pushkit_token_does_not_forget_the_device(app, fake_device):
+    """Only PushKit is gone; alert delivery to the same device is untouched."""
+    form = _register_form(fake_device)
+    form["voipToken"] = "bb" * 32
+    app.register_device(_as_qs_dict(form))
+    app.apns_client.result = apns.ApnsResult(status_code=410, apns_id=None, reason="Unregistered")
+    status, body = app.send_notifications(_notif_form([_call_entry(app, fake_device)]))
+    assert status == HTTPStatus.OK
+    assert body == {"unknown": [], "failed": 1}
+    device = app.store.get(fake_device.device_identifier)
+    assert device is not None
+    assert device.voip_token is None
+
+
+def test_register_rejects_a_malformed_pushkit_token(app, fake_device):
+    form = _register_form(fake_device)
+    form["voipToken"] = "not-a-token"
+    status, body = app.register_device(_as_qs_dict(form))
+    assert status == HTTPStatus.BAD_REQUEST
+    assert body == {"message": "INVALID_VOIP_TOKEN"}
+
+
+def test_register_rejects_a_pushkit_token_on_fcm(app, fake_device):
+    form = _register_form(fake_device)
+    form["pushToken"] = "fcm-token-that-is-long-enough-to-pass-the-shape-check"
+    form["pushProvider"] = "fcm"
+    form.pop("pushEnvironment")
+    form["voipToken"] = "bb" * 32
+    status, body = app.register_device(_as_qs_dict(form))
+    assert status == HTTPStatus.BAD_REQUEST
+    assert body == {"message": "INVALID_VOIP_TOKEN"}
 
 
 def test_notifications_replay_is_silently_dropped(app, fake_device):

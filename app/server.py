@@ -25,7 +25,7 @@ import httpx
 
 from . import apns, crypto, fcm
 from .config import Config
-from .db import DeviceStore, PublicKeyMismatch
+from .db import Device, DeviceStore, PublicKeyMismatch
 from .provider_errors import ProviderResponseError
 
 log = logging.getLogger("nks-talk-notify")
@@ -266,6 +266,7 @@ class App:
         public_key = _first(form, "userPublicKey")
         push_provider = _first(form, "pushProvider")
         push_environment = _first(form, "pushEnvironment")
+        voip_token = _first(form, "voipToken")
         if not (push_token and device_identifier and signature and public_key):
             return HTTPStatus.BAD_REQUEST, {"message": "MISSING_FIELDS"}
 
@@ -291,6 +292,12 @@ class App:
             return HTTPStatus.BAD_REQUEST, {"message": "INVALID_PUSH_ENVIRONMENT"}
         if kind == "fcm" and push_environment is not None:
             return HTTPStatus.BAD_REQUEST, {"message": "INVALID_PUSH_ENVIRONMENT"}
+        # PushKit has a device token of its own, in the same shape as the
+        # ordinary APNs one and never equal to it. Only iOS has one at all.
+        if voip_token is not None and (
+            kind != "apns" or not _APNS_TOKEN_RE.match(voip_token)
+        ):
+            return HTTPStatus.BAD_REQUEST, {"message": "INVALID_VOIP_TOKEN"}
 
         if not crypto.verify_device_identifier_signature(
             device_identifier_b64=device_identifier, signature_b64=signature, public_key_pem=public_key
@@ -305,6 +312,7 @@ class App:
                 push_token_hash=self.push_token_hash(push_token),
                 push_provider=push_provider,
                 push_environment=push_environment,
+                voip_token=voip_token,
             )
         except PublicKeyMismatch:
             # S6: 403 "unauthorized for this identifier", not 409 -- we don't
@@ -400,13 +408,7 @@ class App:
             try:
                 kind = device.push_provider or token_kind(device.push_token)
                 if kind == "apns":
-                    forget = self._send_via_apns(
-                        device.push_token,
-                        subject,
-                        nc_type,
-                        nc_priority,
-                        device.push_environment,
-                    )
+                    forget = self._send_via_apns(device, subject, nc_type, nc_priority)
                 elif kind == "fcm":
                     forget = self._send_via_fcm(device.push_token, subject, nc_priority)
                 else:
@@ -449,11 +451,10 @@ class App:
 
     def _send_via_apns(
         self,
-        device_token: str,
+        device: Device,
         subject: str,
         nc_type: str,
         nc_priority: str,
-        push_environment: Optional[str],
     ) -> Optional[bool]:
         """Returns True if the device should be forgotten, False if delivered
         fine, None on failure that doesn't warrant forgetting it (or if APNs
@@ -463,17 +464,31 @@ class App:
             log.warning("APNs token needs sending but APNs is not configured")
             return None
         push_type, priority = apns.push_type_and_priority(nc_type, nc_priority)
+        # A VoIP push goes to PushKit, which has a device token of its own and
+        # the `.voip` topic; sending one to the ordinary token is refused as
+        # DeviceTokenNotForTopic. A client without PushKit (every client before
+        # this field existed, and every non-iOS one) still has to hear about a
+        # call, so it gets the ordinary alert rather than nothing.
+        if push_type == "voip" and not device.voip_token:
+            push_type = "alert"
+        device_token = device.voip_token if push_type == "voip" else device.push_token
         payload = apns.build_payload(push_type=push_type, encrypted_subject_b64=subject)
         result = self.apns_client.send(
             device_token=device_token,
             payload=payload,
             push_type=push_type,
             priority=priority,
-            environment=push_environment,
+            environment=device.push_environment,
         )
         if result.ok:
             return False
         if result.should_forget_device:
+            if push_type == "voip":
+                # Only the PushKit registration is gone; alert delivery to this
+                # device is untouched, so the row stays and Nextcloud keeps it.
+                log.info("APNs reason=%s for a VoIP token, forgetting only that", result.reason)
+                self.store.clear_voip_token(device.device_identifier)
+                return None
             log.info("APNs reason=%s for a device, forgetting it", result.reason)
             return True
         log.warning("APNs push failed: status=%s reason=%s", result.status_code, result.reason)

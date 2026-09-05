@@ -37,6 +37,7 @@ class Device:
     push_token_hash: str
     push_provider: Optional[str]
     push_environment: Optional[str]
+    voip_token: Optional[str]
     created_at: str
     updated_at: str
 
@@ -49,6 +50,7 @@ CREATE TABLE IF NOT EXISTS devices (
     push_token_hash   TEXT NOT NULL,
     push_provider     TEXT,
     push_environment  TEXT,
+    voip_token        TEXT,
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
 );
@@ -77,6 +79,8 @@ class DeviceStore:
             )
         if "push_provider" not in columns:
             self._conn.execute("ALTER TABLE devices ADD COLUMN push_provider TEXT")
+        if "voip_token" not in columns:
+            self._conn.execute("ALTER TABLE devices ADD COLUMN voip_token TEXT")
         self._conn.commit()
         try:
             os.chmod(db_path, 0o600)  # S8: push tokens are sensitive, owner-only
@@ -100,7 +104,7 @@ class DeviceStore:
     def get(self, device_identifier: str) -> Optional[Device]:
         row = self._conn.execute(
             "SELECT device_identifier, user_public_key, push_token, push_token_hash,"
-            " push_provider, push_environment, created_at, updated_at"
+            " push_provider, push_environment, voip_token, created_at, updated_at"
             " FROM devices WHERE device_identifier = ?",
             (device_identifier,),
         ).fetchone()
@@ -115,6 +119,7 @@ class DeviceStore:
         push_token_hash: str,
         push_provider: Optional[str] = None,
         push_environment: Optional[str] = None,
+        voip_token: Optional[str] = None,
     ) -> Device:
         """Insert a new device, or refresh push_token for an existing one.
 
@@ -138,14 +143,15 @@ class DeviceStore:
                 INSERT INTO devices (
                     device_identifier, user_public_key, push_token,
                     push_token_hash, push_provider, push_environment,
-                    created_at, updated_at
+                    voip_token, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(device_identifier) DO UPDATE SET
                     push_token = excluded.push_token,
                     push_token_hash = excluded.push_token_hash,
                     push_provider = excluded.push_provider,
                     push_environment = excluded.push_environment,
+                    voip_token = excluded.voip_token,
                     updated_at = excluded.updated_at
                 WHERE devices.user_public_key = excluded.user_public_key
                 """,
@@ -156,6 +162,7 @@ class DeviceStore:
                     push_token_hash,
                     push_provider,
                     push_environment,
+                    voip_token,
                     now,
                     now,
                 ),
@@ -163,6 +170,20 @@ class DeviceStore:
             if cur.rowcount == 0:
                 raise PublicKeyMismatch(device_identifier)
         return self.get(device_identifier)  # type: ignore[return-value]
+
+    def clear_voip_token(self, device_identifier: str) -> None:
+        """Forget only the PushKit registration.
+
+        APNs refusing a VoIP token says nothing about the ordinary one, so the
+        device keeps its row and its alert delivery; the next registration
+        brings a fresh PushKit token with it.
+        """
+        with self._write() as cur:
+            cur.execute(
+                "UPDATE devices SET voip_token = NULL, updated_at = ?"
+                " WHERE device_identifier = ?",
+                (_now(), device_identifier),
+            )
 
     def delete(self, device_identifier: str) -> bool:
         with self._write() as cur:
