@@ -13,3 +13,8 @@ data/
 *.db
 *.db-wal
 *.db-shm
+*.pem
+*.key
+secrets/
+*service-account*.json
+.ruff_cache/

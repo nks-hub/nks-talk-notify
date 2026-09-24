@@ -625,7 +625,7 @@ def make_handler(app: App):
             # exhaustion S3 exists to prevent -- `cap` is a fixed constant
             # WE control, never the client's own claim.
             #
-            # It has to be generous, not token-sized: the Apache/ISPConfig
+            # It has to be generous, not token-sized: an Apache mod_proxy_http
             # reverse proxy in front of this service writes the whole
             # request body to us before it will accept any response as
             # valid. If we stop reading before it finishes writing (its
@@ -638,8 +638,7 @@ def make_handler(app: App):
 
         def _client_ip(self) -> str:
             # Only trust X-Forwarded-For when it's the known reverse proxy
-            # (TRUSTED_PROXY_IP, e.g. 192.0.2.10 on the reference
-            # deployment) on the wire directly -- anyone else can put
+            # (TRUSTED_PROXY_IP) on the wire directly -- anyone else can put
             # whatever they like in that header, and if we believed it
             # unconditionally, a single attacker could pick a fresh IP for
             # every request and dodge the rate limiters entirely. Take the
