@@ -5,15 +5,12 @@
 [![Nextcloud](https://img.shields.io/badge/Nextcloud-push--v2-0082C9.svg?logo=nextcloud&logoColor=white)](#the-nextcloud-side)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
 
-> A small self-hosted push gateway for Nextcloud's push-v2 protocol. It receives signed, encrypted notifications from a Nextcloud server and hands them to Apple Push Notification service (APNs, including PushKit for calls) and Firebase Cloud Messaging (FCM HTTP v1).
+> A self-hosted push gateway for Nextcloud's push-v2 protocol. It receives signed, encrypted notifications from a Nextcloud server and hands them to Apple Push Notification service (APNs, including PushKit for calls) and Firebase Cloud Messaging (FCM HTTP v1).
 
 It was written for [OwnTalk](https://github.com/nks-hub/nks-nextcloud-talk),
 a third-party Nextcloud Talk client for Android, iOS and desktop. Nothing in
 the protocol handling is specific to that app: any client that speaks
 push-v2 and whose APNs key or Firebase project you control can use it.
-
-The gateway is one Python process with a SQLite file. It has no admin UI,
-no queue and no clustering.
 
 ---
 
@@ -25,7 +22,7 @@ no queue and no clustering.
 - ✍️ **Signature checks and key pinning** - Every registration and every notification is verified with RSA; the first key registered for a device is pinned against takeover
 - 🔑 **Subscription key auth** - `POST /notifications` accepts only Nextcloud servers whose `push_subscription_key` is configured; several servers can share one gateway
 - 🛡️ **Abuse limits** - Replay guard, per-client rate limits, body and batch size caps, and a cap on how many devices are reported to Nextcloud as `unknown` per hour
-- 🪶 **Small footprint** - One Python process with a SQLite file; Docker image runs as a non-root user with a health check
+- 🪶 **Single process** - One Python process with a SQLite file and no admin UI; the Docker image runs as a non-root user with a health check
 
 ## Requirements
 
@@ -225,7 +222,7 @@ The other endpoints are `POST /notifications` (Nextcloud only, described
 below) and `GET`/`HEAD /health`, which returns `{"status": "ok", "devices":
 <count>}` without authentication.
 
-## Why it exists
+## Why Nextcloud needs a push proxy
 
 Nextcloud does not talk to APNs or FCM itself. The notifications app encrypts
 each notification for the receiving device, signs it with the user's
@@ -341,7 +338,7 @@ under the original key is accepted.
 
 What this does not prevent: somebody who learns a `deviceIdentifier` before
 its owner registers could register first and block the real device. Doing
-that needs values internal to the Nextcloud server. Closing it fully would
+that needs values internal to the Nextcloud server. Closing it would
 require the client to send its user id so the gateway could compare against
 Nextcloud's identity-proof endpoint, which the current protocol does not
 include.
